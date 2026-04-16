@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>文档问答台</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+    <link rel="stylesheet" href="/static/app.css" />
+    <script defer src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <script defer src="/static/app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="sidebar__top">
+          <div class="sidebar-brand">
+            <button id="brandButton" class="brand" type="button" aria-label="返回问答">
+              <span class="brand__icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none">
+                  <path
+                    d="M6 4.5h9.5L19.5 8v11a1.5 1.5 0 0 1-1.5 1.5H6A1.5 1.5 0 0 1 4.5 19V6A1.5 1.5 0 0 1 6 4.5Z"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                  />
+                  <path d="M15.5 4.5V8H19.5" stroke="currentColor" stroke-width="1.5" />
+                  <path d="M8 11h8M8 14h8M8 17h5" stroke="currentColor" stroke-linecap="round" stroke-width="1.5" />
+                </svg>
+              </span>
+              <span class="brand__label">RAG</span>
+            </button>
+            <button id="uploadButton" class="sidebar-upload" type="button">上传</button>
+          </div>
+
+          <div class="sidebar-status">
+            <span class="sidebar-status__label">系统</span>
+            <span id="sidebarStatusMeta" class="sidebar-status__value">0/0 就绪</span>
+          </div>
+
+          <section class="history-panel">
+            <div class="history-panel__head">
+              <div class="history-panel__title">历史记录</div>
+              <div id="conversationMeta" class="history-panel__meta">0 条记录</div>
+            </div>
+            <div id="conversationLibraryList" class="history-list history-list--sidebar"></div>
+          </section>
+        </div>
+
+        <input id="fileInput" type="file" accept=".pdf,application/pdf" hidden />
+      </aside>
+
+      <main id="workspace" class="workspace" data-mode="empty" data-section="ask">
+        <header class="workspace-header">
+          <div class="workspace-header__main">
+            <div class="top-tabs" role="tablist" aria-label="主页面">
+              <button id="navAskButton" class="top-tabs__item" type="button" data-section-target="ask">问答</button>
+              <button id="navDocumentsButton" class="top-tabs__item" type="button" data-section-target="documents">文档库</button>
+            </div>
+            <p id="headerBreadcrumb" class="workspace-breadcrumb">问答</p>
+            <h2 id="conversationTitle">问答</h2>
+            <p id="headerMeta" class="header-meta"></p>
+          </div>
+          <div class="workspace-header__side">
+            <span id="currentDocumentPill" class="header-chip">全局模式</span>
+          </div>
+        </header>
+
+        <div id="statusBanner" class="status-line status-line--info">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="statusText" class="status-text">等待文档</span>
+          <button id="statusActionButton" class="status-action" type="button" hidden>重建索引</button>
+        </div>
+
+        <div class="workspace-views">
+          <section id="askView" class="workspace-view workspace-view--ask">
+            <div class="ask-toolbar">
+              <div class="mode-switch" role="tablist" aria-label="问答模式">
+                <button id="globalChatButton" class="mode-switch__button" type="button">全局问答</button>
+                <button id="singleChatButton" class="mode-switch__button" type="button">单文件问答</button>
+              </div>
+              <div class="ask-toolbar__actions">
+                <div id="askScopeBar" class="scope-bar">
+                  <span id="askModeTag" class="scope-bar__tag">全局模式</span>
+                  <span id="askScopeText" class="scope-bar__text"></span>
+                </div>
+                <button id="jumpToDocumentsButton" class="ghost-action" type="button">浏览文档</button>
+              </div>
+            </div>
+
+            <section class="conversation-stage">
+              <div id="emptyPanel" class="empty-panel">
+                <div class="empty-panel__inner">
+                  <h3 id="emptyTitle">开始问答</h3>
+                  <p id="emptyCopy">输入问题</p>
+                </div>
+              </div>
+
+              <section id="messageList" class="message-list" aria-live="polite"></section>
+
+              <div class="composer-region">
+                <div id="attachmentTray" class="attachment-tray"></div>
+
+                <div class="composer-meta">
+                  <p id="composerHint" class="composer-hint"></p>
+                  <label class="checkbox-label">
+                    <input id="thinkingToggle" type="checkbox" checked />
+                    <span>展示思考</span>
+                  </label>
+                </div>
+
+                <div class="composer-box">
+                  <button id="imagePickerButton" class="tool-button tool-button--icon" type="button" aria-label="添加图片">
+                    <svg viewBox="0 0 24 24" fill="none">
+                      <path
+                        d="M9 8.5v7a3.5 3.5 0 1 0 7 0V6.75a2.25 2.25 0 1 0-4.5 0v7.5a1 1 0 1 0 2 0V8"
+                        stroke="currentColor"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        stroke-width="1.7"
+                      />
+                    </svg>
+                  </button>
+                  <input id="imageInput" type="file" accept="image/*" multiple hidden />
+                  <textarea id="questionInput" rows="1" placeholder="输入问题…"></textarea>
+                  <button id="sendButton" class="send-button" type="button">发送</button>
+                </div>
+              </div>
+            </section>
+          </section>
+
+          <section id="documentsView" class="workspace-view workspace-view--documents" hidden>
+            <div class="section-head">
+              <div class="section-head__title">
+                <h3 class="section-title">文档</h3>
+                <p id="documentMeta" class="section-meta">0 个文档</p>
+              </div>
+              <button id="docsUploadButton" class="primary-button" type="button">上传</button>
+            </div>
+
+            <div class="section-toolbar">
+              <label class="search-box">
+                <span class="search-box__icon" aria-hidden="true">⌕</span>
+                <input id="documentSearchInput" type="text" placeholder="搜索文档名、别名、关键词" />
+              </label>
+              <div id="documentFilterBar" class="filter-bar" role="tablist" aria-label="文档筛选">
+                <button class="filter-chip is-active" type="button" data-document-filter="all">全部</button>
+                <button class="filter-chip" type="button" data-document-filter="ready">就绪</button>
+                <button class="filter-chip" type="button" data-document-filter="building">处理中</button>
+                <button class="filter-chip" type="button" data-document-filter="failed">失败</button>
+              </div>
+            </div>
+
+            <div id="documentLibraryGrid" class="resource-table resource-table--documents"></div>
+          </section>
+        </div>
+      </main>
+
+      <button id="pdfDrawerBackdrop" class="pdf-drawer-backdrop" type="button" aria-label="关闭原文预览"></button>
+
+      <aside id="pdfDrawer" class="pdf-drawer" aria-hidden="true">
+        <div id="pdfDrawerResizeHandle" class="pdf-drawer__resize-handle" aria-hidden="true"></div>
+        <div class="pdf-drawer__header">
+          <div class="pdf-drawer__title-wrap">
+            <p class="pdf-drawer__eyebrow">原文</p>
+            <h3 id="pdfDrawerTitle" class="pdf-drawer__title">未打开文档</h3>
+          </div>
+          <button id="pdfDrawerClose" class="pdf-drawer__close" type="button" aria-label="关闭原文预览">
+            ×
+          </button>
+        </div>
+
+        <div class="pdf-drawer__meta">
+          <span id="pdfDrawerMeta"></span>
+        </div>
+
+        <div id="pdfDrawerBody" class="pdf-drawer__body">
+          <div id="pdfFrameShell" class="pdf-frame-shell" hidden>
+            <iframe id="pdfPreviewFrame" class="pdf-preview-frame" title="PDF 原文预览"></iframe>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </body>
+</html>

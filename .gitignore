@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+.env
+.env.local
+.qwen/
+QWEN.md
+CLAUDE.md
+*_extracted.txt
+data/app.db
+data/uploads/
+data/renders/
