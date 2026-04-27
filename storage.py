@@ -144,6 +144,25 @@ def _ensure_messages_metadata_column(conn: sqlite3.Connection) -> None:
         )
 
 
+def _ensure_document_file_columns(conn: sqlite3.Connection) -> None:
+    existing_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(documents)").fetchall()
+    }
+    if "file_type" not in existing_columns:
+        conn.execute(
+            "ALTER TABLE documents ADD COLUMN file_type TEXT NOT NULL DEFAULT 'pdf'"
+        )
+    if "row_count" not in existing_columns:
+        conn.execute(
+            "ALTER TABLE documents ADD COLUMN row_count INTEGER NOT NULL DEFAULT 0"
+        )
+    if "config_json" not in existing_columns:
+        conn.execute(
+            "ALTER TABLE documents ADD COLUMN config_json TEXT NOT NULL DEFAULT '{}'"
+        )
+
+
 def _ensure_conversations_document_nullable(conn: sqlite3.Connection) -> None:
     columns = conn.execute("PRAGMA table_info(conversations)").fetchall()
     if not columns:
@@ -258,9 +277,49 @@ def init_db() -> None:
                 FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
                 FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS excel_policies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_document_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                search_text TEXT NOT NULL,
+                source_row INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (file_document_id) REFERENCES documents(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS excel_policy_chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                policy_id INTEGER NOT NULL,
+                file_document_id INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                chunk_text TEXT NOT NULL,
+                search_text TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (policy_id) REFERENCES excel_policies(id) ON DELETE CASCADE,
+                FOREIGN KEY (file_document_id) REFERENCES documents(id) ON DELETE CASCADE
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS excel_policy_chunks_fts
+            USING fts5(search_text, content=excel_policy_chunks, content_rowid=id);
+
+            CREATE TABLE IF NOT EXISTS excel_chunk_vec_map (
+                vec_rowid INTEGER PRIMARY KEY,
+                chunk_id INTEGER NOT NULL UNIQUE,
+                policy_id INTEGER NOT NULL,
+                file_document_id INTEGER NOT NULL,
+                FOREIGN KEY (chunk_id) REFERENCES excel_policy_chunks(id) ON DELETE CASCADE,
+                FOREIGN KEY (policy_id) REFERENCES excel_policies(id) ON DELETE CASCADE,
+                FOREIGN KEY (file_document_id) REFERENCES documents(id) ON DELETE CASCADE
+            );
             """
         )
         _ensure_conversations_document_nullable(conn)
+        _ensure_document_file_columns(conn)
         _ensure_document_ocr_columns(conn)
         _ensure_messages_metadata_column(conn)
         conn.execute(
@@ -272,6 +331,15 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_conversation_documents_rank ON conversation_documents(conversation_id, rank_index)"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_excel_policies_file ON excel_policies(file_document_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_excel_chunks_file_policy ON excel_policy_chunks(file_document_id, policy_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_excel_chunk_vec_map_file ON excel_chunk_vec_map(file_document_id, policy_id)"
+        )
         if sqlite_vec_available():
             conn.execute(
                 """
@@ -282,6 +350,12 @@ def init_db() -> None:
             conn.execute(
                 """
                 CREATE VIRTUAL TABLE IF NOT EXISTS doc_profile_vec
+                USING vec0(embedding FLOAT[1024])
+                """
+            )
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS excel_policy_chunk_vec
                 USING vec0(embedding FLOAT[1024])
                 """
             )
@@ -302,6 +376,21 @@ def _document_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+    if "file_type" in row.keys():
+        payload["file_type"] = row["file_type"] or "pdf"
+    else:
+        payload["file_type"] = "pdf"
+    if "row_count" in row.keys():
+        payload["row_count"] = int(row["row_count"] or 0)
+    else:
+        payload["row_count"] = 0
+    if "config_json" in row.keys():
+        try:
+            payload["config"] = json.loads(row["config_json"] or "{}")
+        except Exception:
+            payload["config"] = {}
+    else:
+        payload["config"] = {}
     if "ocr_status" in row.keys():
         payload["ocr_status"] = row["ocr_status"]
     if "ocr_progress" in row.keys():
@@ -387,8 +476,11 @@ def _prepare_fts_query(question: str) -> str:
         deduped.append(token)
         seen.add(token)
 
-    if not deduped:
-        return ""
+    for match in re.finditer(r"(?<![A-Za-z])([A-Za-z]{1,2})(?=[\u4e00-\u9fff])", question):
+        token = match.group(1).lower()
+        if token not in seen:
+            deduped.append(token)
+            seen.add(token)
 
     cjk_tokens = [token.strip() for token in re.findall(r"[\u4e00-\u9fff]{2,}", question) if token.strip()]
     for token in cjk_tokens:
@@ -405,6 +497,9 @@ def _prepare_fts_query(question: str) -> str:
                         continue
                     deduped.append(fragment)
                     seen.add(fragment)
+
+    if not deduped:
+        return ""
 
     return " OR ".join(f'"{token.replace(chr(34), " ")}"' for token in deduped[:16])
 
@@ -488,8 +583,15 @@ def create_document(
     render_dir: str,
     page_count: int,
     version_index: int,
+    file_type: str = "pdf",
+    row_count: int = 0,
+    config: dict[str, Any] | None = None,
+    ocr_status: str = "pending",
+    ocr_progress: int = 0,
+    ocr_detail: str = "",
 ) -> dict[str, Any]:
     now = utc_now()
+    config_json = json.dumps(config or {}, ensure_ascii=False)
     with get_connection() as conn:
         cursor = conn.execute(
             """
@@ -501,12 +603,15 @@ def create_document(
                 render_dir,
                 page_count,
                 version_index,
+                file_type,
+                row_count,
+                config_json,
                 created_at,
                 updated_at,
                 ocr_status,
                 ocr_progress,
                 ocr_detail
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 file_name,
@@ -516,11 +621,14 @@ def create_document(
                 render_dir,
                 page_count,
                 version_index,
+                file_type,
+                int(row_count or 0),
+                config_json,
                 now,
                 now,
-                "pending",
-                0,
-                "",
+                ocr_status,
+                int(ocr_progress or 0),
+                ocr_detail,
             ),
         )
         row = conn.execute(
@@ -840,6 +948,573 @@ def update_ocr_status(
         )
 
 
+def update_document_ingestion_config(
+    document_id: int,
+    *,
+    config: dict[str, Any],
+    row_count: int | None = None,
+    status: str | None = None,
+    progress: int | None = None,
+    detail: str | None = None,
+) -> None:
+    assignments = ["config_json = ?", "updated_at = ?"]
+    params: list[Any] = [json.dumps(config or {}, ensure_ascii=False), utc_now()]
+
+    if row_count is not None:
+        assignments.append("row_count = ?")
+        params.append(max(0, int(row_count)))
+    if status is not None:
+        assignments.append("ocr_status = ?")
+        params.append(status)
+    if progress is not None:
+        assignments.append("ocr_progress = ?")
+        params.append(max(0, min(100, int(progress))))
+    if detail is not None:
+        assignments.append("ocr_detail = ?")
+        params.append(detail.strip())
+
+    with get_connection() as conn:
+        conn.execute(
+            f"UPDATE documents SET {', '.join(assignments)} WHERE id = ?",
+            (*params, document_id),
+        )
+
+
+def try_claim_ingestion(document_id: int) -> bool:
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "UPDATE documents SET ocr_status = 'processing' WHERE id = ? AND ocr_status != 'processing'",
+            (document_id,),
+        )
+        return cursor.rowcount > 0
+
+
+def delete_excel_policy_index(document_id: int, conn: sqlite3.Connection | None = None) -> None:
+    owns_connection = conn is None
+    active_conn = conn or get_connection()
+    try:
+        vec_rowids = [
+            int(row["vec_rowid"])
+            for row in active_conn.execute(
+                "SELECT vec_rowid FROM excel_chunk_vec_map WHERE file_document_id = ?",
+                (document_id,),
+            ).fetchall()
+        ]
+        if vec_rowids and sqlite_vec_available():
+            active_conn.executemany(
+                "DELETE FROM excel_policy_chunk_vec WHERE rowid = ?",
+                [(rowid,) for rowid in vec_rowids],
+            )
+        if vec_rowids:
+            active_conn.executemany(
+                "DELETE FROM excel_chunk_vec_map WHERE vec_rowid = ?",
+                [(rowid,) for rowid in vec_rowids],
+            )
+
+        rows = active_conn.execute(
+            """
+            SELECT id, search_text
+            FROM excel_policy_chunks
+            WHERE file_document_id = ?
+            """,
+            (document_id,),
+        ).fetchall()
+        if rows:
+            active_conn.executemany(
+                """
+                INSERT INTO excel_policy_chunks_fts(excel_policy_chunks_fts, rowid, search_text)
+                VALUES('delete', ?, ?)
+                """,
+                [(int(row["id"]), str(row["search_text"] or "")) for row in rows],
+            )
+        active_conn.execute(
+            "DELETE FROM excel_policy_chunks WHERE file_document_id = ?",
+            (document_id,),
+        )
+        active_conn.execute(
+            "DELETE FROM excel_policies WHERE file_document_id = ?",
+            (document_id,),
+        )
+        if owns_connection:
+            active_conn.commit()
+    finally:
+        if owns_connection:
+            active_conn.close()
+
+
+def save_excel_policy_index(
+    document_id: int,
+    *,
+    config: dict[str, Any],
+    policies: list[dict[str, Any]],
+) -> int:
+    now = utc_now()
+    with get_connection() as conn:
+        delete_excel_policy_index(document_id, conn=conn)
+        for policy in policies:
+            metadata = policy.get("metadata") or {}
+            metadata_json = json.dumps(metadata, ensure_ascii=False)
+            cursor = conn.execute(
+                """
+                INSERT INTO excel_policies (
+                    file_document_id,
+                    title,
+                    content,
+                    metadata_json,
+                    search_text,
+                    source_row,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document_id,
+                    str(policy.get("title") or "").strip(),
+                    str(policy.get("content") or "").strip(),
+                    metadata_json,
+                    str(policy.get("search_text") or "").strip(),
+                    int(policy.get("source_row") or 0),
+                    now,
+                    now,
+                ),
+            )
+            policy_id = int(cursor.lastrowid)
+            for chunk in policy.get("chunks") or []:
+                chunk_metadata = chunk.get("metadata") or metadata
+                chunk_metadata_json = json.dumps(chunk_metadata, ensure_ascii=False)
+                chunk_cursor = conn.execute(
+                    """
+                    INSERT INTO excel_policy_chunks (
+                        policy_id,
+                        file_document_id,
+                        chunk_index,
+                        chunk_text,
+                        search_text,
+                        metadata_json,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        policy_id,
+                        document_id,
+                        int(chunk.get("chunk_index") or 0),
+                        str(chunk.get("chunk_text") or "").strip(),
+                        str(chunk.get("search_text") or "").strip(),
+                        chunk_metadata_json,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO excel_policy_chunks_fts(rowid, search_text)
+                    VALUES (?, ?)
+                    """,
+                    (int(chunk_cursor.lastrowid), str(chunk.get("search_text") or "").strip()),
+                )
+
+        conn.execute(
+            """
+            UPDATE documents
+            SET config_json = ?,
+                row_count = ?,
+                ocr_status = 'processing',
+                ocr_progress = 70,
+                ocr_detail = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                json.dumps(config or {}, ensure_ascii=False),
+                len(policies),
+                f"Excel 全文索引完成：{len(policies)} 条记录，正在准备向量索引。",
+                now,
+                document_id,
+            ),
+        )
+    return len(policies)
+
+
+def list_excel_chunks_for_embedding(document_id: int) -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                c.id AS chunk_id,
+                c.policy_id,
+                c.file_document_id,
+                c.chunk_index,
+                c.chunk_text,
+                c.search_text,
+                p.title
+            FROM excel_policy_chunks c
+            JOIN excel_policies p ON p.id = c.policy_id
+            WHERE c.file_document_id = ?
+            ORDER BY c.id ASC
+            """,
+            (document_id,),
+        ).fetchall()
+    return [
+        {
+            "chunk_id": int(row["chunk_id"]),
+            "policy_id": int(row["policy_id"]),
+            "document_id": int(row["file_document_id"]),
+            "chunk_index": int(row["chunk_index"] or 0),
+            "chunk_text": row["chunk_text"] or "",
+            "search_text": row["search_text"] or "",
+            "title": row["title"] or "",
+        }
+        for row in rows
+    ]
+
+
+def list_excel_chunks_for_search_index(document_id: int) -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                c.id AS chunk_id,
+                c.policy_id,
+                c.file_document_id,
+                c.chunk_index,
+                c.chunk_text,
+                c.search_text,
+                c.metadata_json,
+                p.title,
+                p.source_row,
+                d.file_name,
+                d.display_name,
+                0.0 AS rank
+            FROM excel_policy_chunks c
+            JOIN excel_policies p ON p.id = c.policy_id
+            JOIN documents d ON d.id = c.file_document_id
+            WHERE c.file_document_id = ?
+            ORDER BY c.id ASC
+            """,
+            (document_id,),
+        ).fetchall()
+    return [_excel_chunk_row_to_dict(row) for row in rows]
+
+
+def save_excel_chunk_vector(
+    chunk_id: int,
+    policy_id: int,
+    document_id: int,
+    embedding: list[float],
+) -> None:
+    if not sqlite_vec_available():
+        return
+
+    try:
+        import sqlite_vec
+    except Exception as exc:  # noqa: BLE001
+        _warn_sqlite_vec_once(
+            f"[storage] sqlite-vec import failed, continuing with FTS only: {exc}"
+        )
+        return
+
+    with get_connection() as conn:
+        existing = conn.execute(
+            "SELECT vec_rowid FROM excel_chunk_vec_map WHERE chunk_id = ?",
+            (chunk_id,),
+        ).fetchone()
+        if existing is not None:
+            vec_rowid = int(existing["vec_rowid"])
+            conn.execute("DELETE FROM excel_policy_chunk_vec WHERE rowid = ?", (vec_rowid,))
+            conn.execute("DELETE FROM excel_chunk_vec_map WHERE vec_rowid = ?", (vec_rowid,))
+
+        cursor = conn.execute(
+            "INSERT INTO excel_policy_chunk_vec(embedding) VALUES (?)",
+            (sqlite_vec.serialize_float32(embedding),),
+        )
+        conn.execute(
+            """
+            INSERT INTO excel_chunk_vec_map (vec_rowid, chunk_id, policy_id, file_document_id)
+            VALUES (?, ?, ?, ?)
+            """,
+            (int(cursor.lastrowid), int(chunk_id), int(policy_id), int(document_id)),
+        )
+
+
+def _excel_chunk_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        metadata = json.loads(row["metadata_json"] or "{}")
+    except Exception:
+        metadata = {}
+    return {
+        "chunk_id": int(row["chunk_id"]),
+        "policy_id": int(row["policy_id"]),
+        "document_id": int(row["file_document_id"]),
+        "document_file_name": row["file_name"],
+        "document_display_name": row["display_name"],
+        "title": row["title"],
+        "source_row": int(row["source_row"] or 0),
+        "chunk_index": int(row["chunk_index"] or 0),
+        "chunk_text": row["chunk_text"] or "",
+        "search_text": row["search_text"] or "",
+        "metadata": metadata,
+        "rank": float(row["rank"] or 0),
+    }
+
+
+def get_excel_policy_chunks_by_positions(
+    positions: list[tuple[int, int]],
+    *,
+    document_id: int | None = None,
+) -> list[dict[str, Any]]:
+    normalized_positions = sorted(
+        {
+            (int(policy_id), int(chunk_index))
+            for policy_id, chunk_index in positions
+            if int(chunk_index) >= 0
+        }
+    )
+    if not normalized_positions:
+        return []
+
+    params: list[Any] = []
+    predicates: list[str] = []
+    for policy_id, chunk_index in normalized_positions:
+        predicates.append("(c.policy_id = ? AND c.chunk_index = ?)")
+        params.extend([policy_id, chunk_index])
+
+    filter_sql = ""
+    if document_id is not None:
+        filter_sql = " AND c.file_document_id = ?"
+        params.append(int(document_id))
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT
+                c.id AS chunk_id,
+                c.policy_id,
+                c.file_document_id,
+                c.chunk_index,
+                c.chunk_text,
+                c.search_text,
+                c.metadata_json,
+                p.title,
+                p.source_row,
+                d.file_name,
+                d.display_name,
+                0.0 AS rank
+            FROM excel_policy_chunks c
+            JOIN excel_policies p ON p.id = c.policy_id
+            JOIN documents d ON d.id = c.file_document_id
+            WHERE ({' OR '.join(predicates)})
+              AND d.ocr_status = 'done'
+              {filter_sql}
+            ORDER BY c.file_document_id, c.policy_id, c.chunk_index
+            """,
+            params,
+        ).fetchall()
+
+    return [_excel_chunk_row_to_dict(row) for row in rows]
+
+
+def search_excel_policy_chunks(
+    question: str,
+    *,
+    document_id: int | None = None,
+    filters: dict[str, str] | None = None,
+    top_k: int = 10,
+) -> list[dict[str, Any]]:
+    query = _prepare_fts_query(question)
+    filter_items = {
+        str(key): str(value).strip()
+        for key, value in (filters or {}).items()
+        if str(value or "").strip()
+    }
+    params: list[Any] = []
+    filter_sql = ""
+    if document_id is not None:
+        filter_sql += " AND c.file_document_id = ?"
+        params.append(int(document_id))
+    for key, value in filter_items.items():
+        filter_sql += " AND json_extract(c.metadata_json, ?) = ?"
+        params.extend([f"$.{key}", value])
+
+    rows: list[sqlite3.Row] = []
+    with get_connection() as conn:
+        if query:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    c.id AS chunk_id,
+                    c.policy_id,
+                    c.file_document_id,
+                    c.chunk_index,
+                    c.chunk_text,
+                    c.search_text,
+                    c.metadata_json,
+                    p.title,
+                    p.source_row,
+                    d.file_name,
+                    d.display_name,
+                    bm25(excel_policy_chunks_fts) AS rank
+                FROM excel_policy_chunks_fts f
+                JOIN excel_policy_chunks c ON c.id = f.rowid
+                JOIN excel_policies p ON p.id = c.policy_id
+                JOIN documents d ON d.id = c.file_document_id
+                WHERE f.search_text MATCH ?
+                  AND d.ocr_status = 'done'
+                  {filter_sql}
+                ORDER BY bm25(excel_policy_chunks_fts), c.file_document_id, c.policy_id, c.chunk_index
+                LIMIT ?
+                """,
+                (query, *params, int(top_k)),
+            ).fetchall()
+
+        if not rows:
+            like_query = " ".join(str(question or "").split())
+            if not like_query:
+                return []
+            like_terms = [
+                term
+                for term in re.split(r"[\s,，。；;？?]+", like_query)
+                if term
+            ][:8]
+            like_sql = " AND ".join("lower(c.search_text) LIKE lower(?)" for _ in like_terms)
+            like_params = [f"%{term}%" for term in like_terms]
+            rows = conn.execute(
+                f"""
+                SELECT
+                    c.id AS chunk_id,
+                    c.policy_id,
+                    c.file_document_id,
+                    c.chunk_index,
+                    c.chunk_text,
+                    c.search_text,
+                    c.metadata_json,
+                    p.title,
+                    p.source_row,
+                    d.file_name,
+                    d.display_name,
+                    0.0 AS rank
+                FROM excel_policy_chunks c
+                JOIN excel_policies p ON p.id = c.policy_id
+                JOIN documents d ON d.id = c.file_document_id
+                WHERE d.ocr_status = 'done'
+                  AND {like_sql}
+                  {filter_sql}
+                ORDER BY c.file_document_id, c.policy_id, c.chunk_index
+                LIMIT ?
+                """,
+                (*like_params, *params, int(top_k)),
+            ).fetchall()
+
+    return [_excel_chunk_row_to_dict(row) for row in rows]
+
+
+def vector_search_excel_policy_chunks(
+    embedding: list[float],
+    *,
+    document_id: int | None = None,
+    filters: dict[str, str] | None = None,
+    top_k: int = 10,
+) -> list[dict[str, Any]]:
+    if not sqlite_vec_available():
+        return []
+
+    try:
+        import sqlite_vec
+    except Exception as exc:  # noqa: BLE001
+        _warn_sqlite_vec_once(
+            f"[storage] sqlite-vec import failed, continuing with FTS only: {exc}"
+        )
+        return []
+
+    filter_items = {
+        str(key): str(value).strip()
+        for key, value in (filters or {}).items()
+        if str(value or "").strip()
+    }
+    params: list[Any] = []
+    filter_sql = ""
+    if document_id is not None:
+        filter_sql += " AND c.file_document_id = ?"
+        params.append(int(document_id))
+    for key, value in filter_items.items():
+        filter_sql += " AND json_extract(c.metadata_json, ?) = ?"
+        params.extend([f"$.{key}", value])
+
+    try:
+        query_blob = sqlite_vec.serialize_float32(embedding)
+        with get_connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    c.id AS chunk_id,
+                    c.policy_id,
+                    c.file_document_id,
+                    c.chunk_index,
+                    c.chunk_text,
+                    c.search_text,
+                    c.metadata_json,
+                    p.title,
+                    p.source_row,
+                    d.file_name,
+                    d.display_name,
+                    distance AS rank
+                FROM excel_policy_chunk_vec v
+                JOIN excel_chunk_vec_map m ON m.vec_rowid = v.rowid
+                JOIN excel_policy_chunks c ON c.id = m.chunk_id
+                JOIN excel_policies p ON p.id = c.policy_id
+                JOIN documents d ON d.id = c.file_document_id
+                WHERE v.embedding MATCH ? AND k = ?
+                  AND d.ocr_status = 'done'
+                  {filter_sql}
+                ORDER BY distance
+                """,
+                (query_blob, int(top_k), *params),
+            ).fetchall()
+        return [_excel_chunk_row_to_dict(row) for row in rows]
+    except Exception as exc:  # noqa: BLE001
+        _warn_sqlite_vec_once(
+            f"[storage] sqlite-vec query failed, continuing with FTS only: {exc}"
+        )
+        return []
+
+
+def list_ready_excel_documents() -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM documents
+            WHERE file_type = 'excel'
+              AND ocr_status = 'done'
+            ORDER BY updated_at DESC, id DESC
+            """
+        ).fetchall()
+    return [_document_to_dict(row) for row in rows]
+
+
+def get_excel_filter_enums(document_id: int) -> dict[str, list[str]]:
+    doc = get_document(document_id)
+    filter_fields = (doc.get("config") or {}).get("filter_fields") or [] if doc else []
+    if not filter_fields:
+        return {}
+    result: dict[str, list[str]] = {}
+    with get_connection() as conn:
+        for field in filter_fields:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT json_extract(metadata_json, ?) AS val
+                FROM excel_policies
+                WHERE file_document_id = ?
+                  AND json_extract(metadata_json, ?) IS NOT NULL
+                  AND json_extract(metadata_json, ?) != ''
+                ORDER BY val
+                """,
+                (f"$.{field}", document_id, f"$.{field}", f"$.{field}"),
+            ).fetchall()
+            values = [str(row["val"]) for row in rows if row["val"]]
+            if values:
+                result[field] = values
+    return result
+
+
 def fail_inflight_ocr_jobs(detail: str) -> int:
     payload = detail.strip()
     with get_connection() as conn:
@@ -907,6 +1582,7 @@ def delete_page_ocr(document_id: int) -> None:
 
 def delete_document(document_id: int) -> bool:
     delete_page_ocr(document_id)
+    delete_excel_policy_index(document_id)
     with get_connection() as conn:
         cursor = conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
     return cursor.rowcount > 0

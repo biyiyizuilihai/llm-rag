@@ -20,6 +20,15 @@ const state = {
     loading: false,
     error: "",
   },
+  excelConfig: {
+    visible: false,
+    documentId: null,
+    columns: [],
+    sampleRows: [],
+    suggested: {},
+    rowCount: 0,
+    sheetName: "",
+  },
 }
 
 const refs = {}
@@ -117,6 +126,22 @@ function bindRefs() {
   refs.pdfDrawerResizeHandle = document.getElementById("pdfDrawerResizeHandle")
   refs.pdfFrameShell = document.getElementById("pdfFrameShell")
   refs.pdfPreviewFrame = document.getElementById("pdfPreviewFrame")
+  refs.excelConfigModal = document.getElementById("excelConfigModal")
+  refs.excelConfigBackdrop = document.getElementById("excelConfigBackdrop")
+  refs.excelConfigForm = document.getElementById("excelConfigForm")
+  refs.excelConfigTitle = document.getElementById("excelConfigTitle")
+  refs.excelConfigMeta = document.getElementById("excelConfigMeta")
+  refs.excelConfigClose = document.getElementById("excelConfigClose")
+  refs.excelTitleField = document.getElementById("excelTitleField")
+  refs.excelContentField = document.getElementById("excelContentField")
+  refs.excelFilterField = document.getElementById("excelFilterField")
+  refs.excelSourceField = document.getElementById("excelSourceField")
+  refs.excelChunkSize = document.getElementById("excelChunkSize")
+  refs.excelChunkOverlap = document.getElementById("excelChunkOverlap")
+  refs.excelPreviewMeta = document.getElementById("excelPreviewMeta")
+  refs.excelSampleTable = document.getElementById("excelSampleTable")
+  refs.excelConfigCancel = document.getElementById("excelConfigCancel")
+  refs.excelConfigSubmit = document.getElementById("excelConfigSubmit")
 }
 
 function bindEvents() {
@@ -219,6 +244,10 @@ function bindEvents() {
   refs.pdfDrawerClose.addEventListener("click", closePdfPanel)
   refs.pdfDrawerBackdrop.addEventListener("click", closePdfPanel)
   refs.pdfDrawerResizeHandle.addEventListener("pointerdown", startPdfDrawerResize)
+  refs.excelConfigForm.addEventListener("submit", submitExcelConfig)
+  refs.excelConfigClose.addEventListener("click", closeExcelConfigModal)
+  refs.excelConfigCancel.addEventListener("click", closeExcelConfigModal)
+  refs.excelConfigBackdrop.addEventListener("click", closeExcelConfigModal)
 
   refs.messageList.addEventListener(
     "scroll",
@@ -262,6 +291,10 @@ function bindEvents() {
   })
 
   document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && state.excelConfig.visible) {
+      closeExcelConfigModal()
+      return
+    }
     if (event.key === "Escape" && state.pdfPanel.visible) {
       closePdfPanel()
     }
@@ -682,6 +715,10 @@ function hasAnyQueryableDocument() {
   return state.documents.some((document) => document.ocr_status === "done")
 }
 
+function isExcelDocument(document) {
+  return document?.file_type === "excel"
+}
+
 function documentOcrStatus(document) {
   return document?.ocr_status || "pending"
 }
@@ -731,7 +768,10 @@ function buildDocumentNavMeta(document) {
   if (!document) {
     return ""
   }
-  return `${document.page_count} 页 · ${buildDocumentIndexLabel(document)}`
+  const sizeLabel = isExcelDocument(document)
+    ? `${Number(document.row_count || 0)} 行`
+    : `${document.page_count} 页`
+  return `${sizeLabel} · ${buildDocumentIndexLabel(document)}`
 }
 
 function filteredDocuments() {
@@ -825,20 +865,26 @@ function syncSidebarStatus() {
 
 function syncStatusActionButton() {
   const document = currentDocument()
-  const canRebuild = Boolean(document && isDocumentIndexFailed(document) && !state.isSubmitting)
+  const canRebuild = Boolean(document && !isExcelDocument(document) && isDocumentIndexFailed(document) && !state.isSubmitting)
   refs.statusActionButton.hidden = !canRebuild
   refs.statusActionButton.disabled = !canRebuild
 }
 
 async function uploadDocument(file) {
-  if (!file.name.toLowerCase().endsWith(".pdf")) {
-    setStatusLine("仅支持上传 PDF 文件。", "warning")
+  const lowerName = file.name.toLowerCase()
+  const isSupported =
+    lowerName.endsWith(".pdf") ||
+    lowerName.endsWith(".xls") ||
+    lowerName.endsWith(".xlsx") ||
+    lowerName.endsWith(".xlsm")
+  if (!isSupported) {
+    setStatusLine("仅支持上传 PDF 或 Excel（.xls/.xlsx/.xlsm）文件。", "warning")
     return
   }
 
   state.isSubmitting = true
   syncComposerState()
-  setStatusLine(`正在处理 ${file.name}，首次上传会先完成页面缓存。`, "info")
+  setStatusLine(`正在处理 ${file.name}。`, "info")
 
   try {
     const formData = new FormData()
@@ -854,15 +900,196 @@ async function uploadDocument(file) {
     state.currentSection = "ask"
     await loadConversation(result.conversation.id, false)
 
+    if (result.document?.file_type === "excel" && result.excel_preview) {
+      await configureExcelDocument(result.document.id, result.excel_preview)
+      return
+    }
+
     const { message, kind } = buildDocumentIndexStatusLine(currentDocument() || result.document)
     setStatusLine(message, kind)
 
-    void pollOcrStatus(result.document.id)
+    if (result.document?.file_type !== "excel") {
+      void pollOcrStatus(result.document.id)
+    }
   } catch (error) {
     console.error(error)
     setStatusLine(error.message || "上传失败。", "error")
   } finally {
     state.isSubmitting = false
+    syncComposerState()
+  }
+}
+
+async function configureExcelDocument(documentId, preview) {
+  const columns = preview.columns || []
+  const suggested = preview.suggested_config || {}
+  if (!columns.length) {
+    setStatusLine("Excel 表头为空，无法配置字段。", "error")
+    return
+  }
+
+  state.excelConfig = {
+    visible: true,
+    documentId,
+    columns,
+    sampleRows: preview.sample_rows || [],
+    suggested,
+    rowCount: Number(preview.row_count || 0),
+    sheetName: preview.sheet_name || "",
+  }
+  renderExcelConfigModal()
+  setStatusLine("请选择 Excel 字段后建立索引。", "info")
+}
+
+function closeExcelConfigModal() {
+  state.excelConfig.visible = false
+  renderExcelConfigModal()
+}
+
+function selectedExcelField(ref) {
+  return String(ref?.value || "").trim()
+}
+
+function setSelectOptions(select, columns, selectedValue, includeEmpty = false) {
+  const options = includeEmpty ? ['<option value="">不使用</option>'] : []
+  options.push(
+    ...columns.map((column) => {
+      const selected = column === selectedValue ? " selected" : ""
+      return `<option value="${escapeHtml(column)}"${selected}>${escapeHtml(column)}</option>`
+    }),
+  )
+  select.innerHTML = options.join("")
+}
+
+function sampleCellText(value) {
+  const text = String(value || "")
+  const compact = text.replace(/\s+/g, " ").trim()
+  if (compact.length <= 220) {
+    return compact
+  }
+  return `${compact.slice(0, 220)}...`
+}
+
+function renderExcelSampleTable(columns, rows) {
+  if (!rows.length) {
+    return '<div class="library-empty">暂无样例行</div>'
+  }
+
+  return `
+    <table>
+      <thead>
+        <tr>${columns.map((column) => `<th>${escapeHtml(column)}</th>`).join("")}</tr>
+      </thead>
+      <tbody>
+        ${rows
+          .slice(0, 3)
+          .map(
+            (row) => `
+              <tr>
+                ${columns.map((column) => `<td>${escapeHtml(sampleCellText(row[column]))}</td>`).join("")}
+              </tr>
+            `,
+          )
+          .join("")}
+      </tbody>
+    </table>
+  `
+}
+
+function renderExcelConfigModal() {
+  const modal = state.excelConfig
+  refs.excelConfigModal.classList.toggle("is-visible", modal.visible)
+  refs.excelConfigModal.setAttribute("aria-hidden", String(!modal.visible))
+
+  if (!modal.visible) {
+    return
+  }
+
+  const suggested = modal.suggested || {}
+  const columns = modal.columns || []
+  const titleField = suggested.title_field || columns[0] || ""
+  const contentField = (suggested.content_fields || [])[0] || columns[columns.length - 1] || ""
+  const filterField = (suggested.filter_fields || [])[0] || ""
+  const sourceField = (suggested.source_fields || [])[0] || ""
+  const chunking = suggested.chunking || {}
+
+  refs.excelConfigTitle.textContent = "配置 Excel 字段"
+  refs.excelConfigMeta.textContent = [
+    modal.sheetName ? `工作表：${modal.sheetName}` : "",
+    `${modal.rowCount || 0} 行`,
+  ]
+    .filter(Boolean)
+    .join(" · ")
+
+  setSelectOptions(refs.excelTitleField, columns, titleField)
+  setSelectOptions(refs.excelContentField, columns, contentField)
+  setSelectOptions(refs.excelFilterField, columns, filterField, true)
+  setSelectOptions(refs.excelSourceField, columns, sourceField, true)
+  refs.excelChunkSize.value = Number(chunking.fallback_chunk_size || 1000)
+  refs.excelChunkOverlap.value = Number(chunking.overlap || 100)
+  refs.excelPreviewMeta.textContent = `${columns.length} 列`
+  refs.excelSampleTable.innerHTML = renderExcelSampleTable(columns, modal.sampleRows || [])
+}
+
+async function submitExcelConfig(event) {
+  event.preventDefault()
+  const documentId = state.excelConfig.documentId
+  if (!documentId || state.isSubmitting) {
+    return
+  }
+
+  const titleField = selectedExcelField(refs.excelTitleField)
+  const contentField = selectedExcelField(refs.excelContentField)
+  const filterField = selectedExcelField(refs.excelFilterField)
+  const sourceField = selectedExcelField(refs.excelSourceField)
+  if (!titleField || !contentField) {
+    setStatusLine("标题字段和正文字段不能为空。", "warning")
+    return
+  }
+
+  state.isSubmitting = true
+  syncComposerState()
+  refs.excelConfigSubmit.disabled = true
+  refs.excelConfigSubmit.textContent = "提交中"
+  setStatusLine("正在提交 Excel 索引任务。", "info")
+
+  try {
+    const payload = {
+      title_field: titleField,
+      content_fields: [contentField],
+      filter_fields: filterField ? [filterField] : [],
+      source_fields: sourceField ? [sourceField] : [],
+      display_fields: [titleField, filterField, sourceField].filter(Boolean),
+      ignore_fields: state.excelConfig.suggested?.ignore_fields || [],
+      chunking: {
+        enabled: true,
+        strategy: "fixed_overlap",
+        fallback_chunk_size: Number(refs.excelChunkSize.value || 1000),
+        overlap: Number(refs.excelChunkOverlap.value || 100),
+      },
+    }
+    const result = await api(`/api/documents/${documentId}/excel-config`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    })
+
+    state.documents = sortByUpdatedAt(upsertById(state.documents, result.document))
+    closeExcelConfigModal()
+    renderAll()
+    if (result.document) {
+      void pollOcrStatus(result.document.id)
+    }
+    setStatusLine(result.detail || "Excel 索引任务已提交，正在后台处理。", "info")
+  } catch (error) {
+    console.error(error)
+    setStatusLine(error.message || "Excel 索引失败。", "error")
+  } finally {
+    state.isSubmitting = false
+    refs.excelConfigSubmit.disabled = false
+    refs.excelConfigSubmit.textContent = "建立索引"
     syncComposerState()
   }
 }
@@ -880,7 +1107,9 @@ function patchDocumentRow(document) {
   card.classList.toggle("is-active", document.id === state.activeDocumentId)
   const pages = card.querySelector(".document-row__pages")
   if (pages) {
-    pages.textContent = `${document.page_count} 页`
+    pages.textContent = isExcelDocument(document)
+      ? `${Number(document.row_count || 0)} 行`
+      : `${document.page_count} 页`
   }
 
   // 更新状态徽章（OCR 状态变化时自动同步）
@@ -1347,8 +1576,13 @@ async function sendQuestion() {
     return
   }
 
+  if (currentMode() === "single" && !isDocumentIndexReady(currentDocument())) {
+    setStatusLine("当前文档索引尚未就绪，请先完成索引。", "warning")
+    return
+  }
+
   if (!hasAnyQueryableDocument()) {
-    setStatusLine("至少需要一份已完成 OCR 的文档后才能提问。", "warning")
+    setStatusLine("至少需要一份已完成索引的文档后才能提问。", "warning")
     return
   }
 
@@ -1395,13 +1629,14 @@ async function sendQuestion() {
     await streamConversation(question, tempUserId, tempAssistantId)
   } catch (error) {
     console.error(error)
-    state.messages = state.messages.filter(
-      (message) => message.id !== tempUserId && message.id !== tempAssistantId,
-    )
-    refs.questionInput.value = question
-    autoResizeTextarea()
+    const errorMsg = error.message || "发送失败。"
+    const tempAssistant = state.messages.find((m) => m.id === tempAssistantId)
+    if (tempAssistant) {
+      tempAssistant.content = errorMsg
+      tempAssistant.is_error = true
+    }
     renderWorkspace()
-    setStatusLine(error.message || "发送失败。", "error")
+    setStatusLine(errorMsg, "error")
   } finally {
     state.isSubmitting = false
     syncComposerState()
@@ -1708,7 +1943,18 @@ function renderDocuments() {
           : ""
       const aliases = (document.title_aliases || []).slice(0, 3).join(" · ")
       const keywords = (document.keywords || []).slice(0, 4).join(" · ")
-      const detail = aliases || keywords || "—"
+      const detail = isExcelDocument(document)
+        ? `Excel · ${Number(document.row_count || 0)} 行`
+        : aliases || keywords || "—"
+      const sizeLabel = isExcelDocument(document)
+        ? `${Number(document.row_count || 0)} 行`
+        : `${document.page_count} 页`
+      const openButton = isExcelDocument(document)
+        ? ""
+        : `<button class="doc-action" type="button" data-document-open="${document.id}">查看原文</button>`
+      const configButton = isExcelDocument(document)
+        ? `<button class="doc-action ${isDocumentIndexReady(document) ? "" : "doc-action--primary"}" type="button" data-excel-config="${document.id}">${isDocumentIndexReady(document) ? "重建索引" : "配置字段"}</button>`
+        : ""
       return `
         <article class="document-row ${activeClass}" data-document-card-id="${document.id}">
           <div class="document-row__main">
@@ -1719,11 +1965,12 @@ function renderDocuments() {
             <div class="document-row__detail">${escapeHtml(detail)}</div>
           </div>
           <div class="document-status-badge ${badgeClass}">${badge}</div>
-          <div class="document-row__pages">${document.page_count} 页</div>
+          <div class="document-row__pages">${sizeLabel}</div>
           <div class="document-row__actions">
             <button class="doc-action doc-action--primary" type="button" data-document-chat="${document.id}">问答</button>
-            <button class="doc-action" type="button" data-document-open="${document.id}">查看原文</button>
-            ${badge === "失败" ? `<button class="doc-action doc-action--warn" type="button" data-document-rebuild="${document.id}">重建索引</button>` : ""}
+            ${openButton}
+            ${configButton}
+            ${badge === "失败" && !isExcelDocument(document) ? `<button class="doc-action doc-action--warn" type="button" data-document-rebuild="${document.id}">重建索引</button>` : ""}
             <button class="doc-action doc-action--icon" type="button" data-document-delete="${document.id}" aria-label="删除">
               <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
                 <path
@@ -1750,6 +1997,21 @@ function renderDocuments() {
   refs.documentLibraryGrid.querySelectorAll("[data-document-open]").forEach((element) => {
     element.addEventListener("click", async () => {
       await previewDocument(Number(element.dataset.documentOpen), 1)
+    })
+  })
+
+  refs.documentLibraryGrid.querySelectorAll("[data-excel-config]").forEach((element) => {
+    element.addEventListener("click", async () => {
+      if (state.isSubmitting) {
+        return
+      }
+      try {
+        const preview = await api(`/api/documents/${Number(element.dataset.excelConfig)}/excel-preview`)
+        await configureExcelDocument(Number(element.dataset.excelConfig), preview)
+      } catch (error) {
+        console.error(error)
+        setStatusLine(error.message || "读取 Excel 表头失败。", "error")
+      }
     })
   })
 

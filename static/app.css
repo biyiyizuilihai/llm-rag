@@ -1394,6 +1394,186 @@ textarea:disabled {
   background: #3a3f4f;
 }
 
+.excel-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.excel-modal.is-visible {
+  display: flex;
+}
+
+.excel-modal__backdrop {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  background: rgba(15, 23, 42, 0.32);
+  cursor: default;
+}
+
+.excel-modal__panel {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 16px;
+  width: min(760px, 100%);
+  max-height: min(760px, calc(100vh - 48px));
+  overflow: auto;
+  padding: 18px 18px 0;
+  border: 1px solid rgba(22, 119, 255, 0.18);
+  border-radius: 12px;
+  background: #ffffff;
+  box-shadow: 0 24px 70px rgba(31, 35, 41, 0.2);
+}
+
+.excel-modal__header,
+.excel-modal__footer,
+.excel-preview__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.excel-modal__footer {
+  position: sticky;
+  bottom: 0;
+  z-index: 3;
+  margin: 0 -18px;
+  padding: 12px 18px 18px;
+  border-top: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.96);
+  backdrop-filter: blur(10px);
+}
+
+.excel-modal__eyebrow {
+  margin: 0 0 4px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.excel-modal__title {
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.25;
+}
+
+.excel-modal__close {
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  color: var(--text-soft);
+  cursor: pointer;
+}
+
+.excel-modal__close:hover {
+  border-color: rgba(22, 119, 255, 0.3);
+  color: var(--text);
+}
+
+.excel-modal__meta,
+.excel-preview__head {
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.excel-field-grid,
+.excel-chunk-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.excel-field {
+  display: grid;
+  gap: 7px;
+}
+
+.excel-field span {
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.excel-field select,
+.excel-field input {
+  width: 100%;
+  min-height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.excel-field select:focus,
+.excel-field input:focus {
+  outline: none;
+  border-color: rgba(22, 119, 255, 0.42);
+  box-shadow: 0 0 0 3px rgba(22, 119, 255, 0.08);
+}
+
+.excel-preview {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.excel-sample-table {
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.excel-sample-table table {
+  width: 100%;
+  min-width: 620px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.excel-sample-table th,
+.excel-sample-table td {
+  max-width: 260px;
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+
+.excel-sample-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel-muted);
+  color: var(--text);
+  font-weight: 700;
+}
+
+.excel-sample-table td {
+  color: var(--text-soft);
+  line-height: 1.5;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.excel-sample-table tr:last-child td {
+  border-bottom: 0;
+}
+
 @media (max-width: 980px) {
   body {
     overflow: auto;
@@ -1437,6 +1617,11 @@ textarea:disabled {
   .document-row__actions,
   .history-item__actions {
     flex-wrap: wrap;
+  }
+
+  .excel-field-grid,
+  .excel-chunk-row {
+    grid-template-columns: 1fr;
   }
 }
 

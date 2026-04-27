@@ -47,7 +47,7 @@
           </section>
         </div>
 
-        <input id="fileInput" type="file" accept=".pdf,application/pdf" hidden />
+        <input id="fileInput" type="file" accept=".pdf,.xls,.xlsx,.xlsm,application/pdf" hidden />
       </aside>
 
       <main id="workspace" class="workspace" data-mode="empty" data-section="ask">
@@ -180,6 +180,66 @@
           </div>
         </div>
       </aside>
+
+      <section id="excelConfigModal" class="excel-modal" aria-hidden="true">
+        <button id="excelConfigBackdrop" class="excel-modal__backdrop" type="button" aria-label="关闭字段配置"></button>
+        <form id="excelConfigForm" class="excel-modal__panel">
+          <div class="excel-modal__header">
+            <div>
+              <p class="excel-modal__eyebrow">Excel 索引</p>
+              <h3 id="excelConfigTitle" class="excel-modal__title">配置字段</h3>
+            </div>
+            <button id="excelConfigClose" class="excel-modal__close" type="button" aria-label="关闭字段配置">×</button>
+          </div>
+
+          <div class="excel-modal__meta">
+            <span id="excelConfigMeta"></span>
+          </div>
+
+          <div class="excel-field-grid">
+            <label class="excel-field">
+              <span>标题字段</span>
+              <select id="excelTitleField" required></select>
+            </label>
+            <label class="excel-field">
+              <span>正文字段</span>
+              <select id="excelContentField" required></select>
+            </label>
+            <label class="excel-field">
+              <span>筛选字段</span>
+              <select id="excelFilterField"></select>
+            </label>
+            <label class="excel-field">
+              <span>来源字段</span>
+              <select id="excelSourceField"></select>
+            </label>
+          </div>
+
+          <div class="excel-chunk-row">
+            <label class="excel-field excel-field--compact">
+              <span>分段长度</span>
+              <input id="excelChunkSize" type="number" min="200" max="5000" step="100" value="1000" />
+            </label>
+            <label class="excel-field excel-field--compact">
+              <span>重叠长度</span>
+              <input id="excelChunkOverlap" type="number" min="0" max="1000" step="50" value="100" />
+            </label>
+          </div>
+
+          <div class="excel-preview">
+            <div class="excel-preview__head">
+              <span>样例数据</span>
+              <span id="excelPreviewMeta"></span>
+            </div>
+            <div id="excelSampleTable" class="excel-sample-table"></div>
+          </div>
+
+          <div class="excel-modal__footer">
+            <button id="excelConfigCancel" class="ghost-action" type="button">取消</button>
+            <button id="excelConfigSubmit" class="primary-button" type="submit">建立索引</button>
+          </div>
+        </form>
+      </section>
     </div>
   </body>
 </html>
