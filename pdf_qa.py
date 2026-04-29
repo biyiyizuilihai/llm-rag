@@ -19,7 +19,6 @@ from PIL import Image
 from openai import OpenAI
 from pypdf import PdfReader, PdfWriter
 
-import es_search
 from storage import (
     fts_search_document_profiles,
     delete_page_ocr,
@@ -1828,14 +1827,6 @@ def ocr_pipeline(document_id: int, pdf_path: str) -> None:
             )
 
         if non_empty_pages:
-            if es_search.enabled():
-                try:
-                    es_search.delete_document("pdf", document_id)
-                    es_count = es_search.index_pdf_pages(document, dict(non_empty_pages))
-                    logger.info("[ocr.es.index.done] document_id=%s pages=%s", document_id, es_count)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("[ocr.es.index.failed] document_id=%s error=%s", document_id, exc)
-
             processed_vectors = 0
             total_vectors = len(non_empty_pages)
             logger.info(
@@ -1925,23 +1916,9 @@ def retrieve_pages(
 
     fts_pages: list[int] = []
     phrase_pages: list[int] = []
-    es_pages: list[int] = []
     seen_text_pages: set[int] = set()
 
     for query in query_variants or [question]:
-        if os.environ.get("PDF_RETRIEVAL_BACKEND", "sqlite").strip().lower() in {
-            "es",
-            "elasticsearch",
-            "opensearch",
-            "hybrid",
-            "hybrid_es",
-        }:
-            try:
-                for page_number in es_search.search_pdf_pages(query, document_id=document_id, top_k=fts_top_k):
-                    if page_number not in es_pages:
-                        es_pages.append(page_number)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[pdf.es.search.failed] document_id=%s query=%r error=%s", document_id, query[:80], exc)
         for page_number in fts_search_pages(query, document_id, top_k=fts_top_k):
             if page_number in seen_text_pages:
                 continue
@@ -1998,7 +1975,7 @@ def retrieve_pages(
 
     seen: set[int] = set()
     hit_pages: list[int] = []
-    for page_number in keyword_pages + es_pages + phrase_pages + fts_pages + vec_pages:
+    for page_number in keyword_pages + phrase_pages + fts_pages + vec_pages:
         if page_number in seen:
             continue
         seen.add(page_number)
@@ -2096,12 +2073,11 @@ def retrieve_pages(
             break
 
     logger.info(
-        "[retrieval] document_id=%s scope=%s question=%r keyword_pages=%s es_pages=%s fts_pages=%s vec_pages=%s overview_pages=%s secondary_queries=%s secondary_pages=%s context_pages=%s",
+        "[retrieval] document_id=%s scope=%s question=%r keyword_pages=%s fts_pages=%s vec_pages=%s overview_pages=%s secondary_queries=%s secondary_pages=%s context_pages=%s",
         document_id,
         scope,
         preview_text(question),
         keyword_pages,
-        es_pages,
         phrase_pages + fts_pages,
         vec_pages,
         overview_pages,

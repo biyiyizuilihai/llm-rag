@@ -1203,34 +1203,6 @@ def list_excel_chunks_for_embedding(document_id: int) -> list[dict[str, Any]]:
     ]
 
 
-def list_excel_chunks_for_search_index(document_id: int) -> list[dict[str, Any]]:
-    with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                c.id AS chunk_id,
-                c.policy_id,
-                c.file_document_id,
-                c.chunk_index,
-                c.chunk_text,
-                c.search_text,
-                c.metadata_json,
-                p.title,
-                p.source_row,
-                d.file_name,
-                d.display_name,
-                0.0 AS rank
-            FROM excel_policy_chunks c
-            JOIN excel_policies p ON p.id = c.policy_id
-            JOIN documents d ON d.id = c.file_document_id
-            WHERE c.file_document_id = ?
-            ORDER BY c.id ASC
-            """,
-            (document_id,),
-        ).fetchall()
-    return [_excel_chunk_row_to_dict(row) for row in rows]
-
-
 def save_excel_chunk_vector(
     chunk_id: int,
     policy_id: int,

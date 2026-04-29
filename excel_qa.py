@@ -10,14 +10,12 @@ from typing import Any
 
 from openpyxl import load_workbook
 
-import es_search
 from pdf_qa import DEFAULT_BASE_URL, DEFAULT_MODEL, build_openai_client, encode_texts, extract_response_text
 from storage import (
     get_excel_filter_enums,
     get_excel_policy_chunks_by_positions,
     get_document,
     list_excel_chunks_for_embedding,
-    list_excel_chunks_for_search_index,
     list_ready_excel_documents,
     save_excel_policy_index,
     save_excel_chunk_vector,
@@ -416,13 +414,6 @@ def ingest_excel_file(document_id: int, config: dict[str, Any]) -> dict[str, Any
         config=normalized_config,
         policies=policies,
     )
-    es_count = 0
-    if es_search.enabled():
-        try:
-            es_search.delete_document("excel", document_id)
-            es_count = es_search.index_excel_chunks(list_excel_chunks_for_search_index(document_id))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[excel.es.index.failed] document_id=%s error=%s", document_id, exc)
 
     vector_count = 0
     vector_detail = ""
@@ -433,10 +424,9 @@ def ingest_excel_file(document_id: int, config: dict[str, Any]) -> dict[str, Any
 
     final_detail = (
         f"Excel 混合索引完成：{indexed_count} 条记录、{vector_count} 个向量"
-        f"{f'、{es_count} 个 ES 文档' if es_count else ''}。"
         if vector_count
         else f"Excel 全文索引完成：{indexed_count} 条记录"
-        f"{f'、{es_count} 个 ES 文档' if es_count else ''}。{vector_detail}"
+        f"。{vector_detail}"
     )
     update_document_ingestion_config(
         document_id,
@@ -543,33 +533,7 @@ def hybrid_search_excel_chunks(
     document_id: int | None,
     filters: dict[str, str],
     top_k: int = MAX_CONTEXT_CHUNKS,
-    backend: str | None = None,
 ) -> list[dict[str, Any]]:
-    backend = (backend or "sqlite").strip().lower()
-    use_sqlite = backend in {"sqlite", "default", "hybrid", "hybrid_es"}
-    use_es = backend in {"es", "elasticsearch", "opensearch", "hybrid", "hybrid_es"}
-    es_query = question
-
-    if use_es and not use_sqlite:
-        try:
-            es_hits = es_search.search_excel_chunks(
-                es_query,
-                document_id=document_id,
-                filters=filters,
-                top_k=max(top_k, EXCEL_RETRIEVAL_SOURCE_TOP_K),
-            )
-            if not es_hits and es_query != question:
-                es_hits = es_search.search_excel_chunks(
-                    question,
-                    document_id=document_id,
-                    filters=filters,
-                    top_k=max(top_k, EXCEL_RETRIEVAL_SOURCE_TOP_K),
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[excel.es.search.failed] question=%r error=%s", question[:80], exc)
-            es_hits = []
-        return es_hits[:top_k]
-
     fts_hits = search_excel_policy_chunks(
         search_query,
         document_id=document_id,
@@ -599,32 +563,10 @@ def hybrid_search_excel_chunks(
             logger.warning("[excel.vector.search.failed] question=%r error=%s", question[:80], exc)
             vector_hits = []
 
-    es_hits: list[dict[str, Any]] = []
-    if use_es and es_search.enabled():
-        try:
-            es_hits = es_search.search_excel_chunks(
-                es_query,
-                document_id=document_id,
-                filters=filters,
-                top_k=EXCEL_RETRIEVAL_SOURCE_TOP_K,
-            )
-            if not es_hits and es_query != question:
-                es_hits = es_search.search_excel_chunks(
-                    question,
-                    document_id=document_id,
-                    filters=filters,
-                    top_k=EXCEL_RETRIEVAL_SOURCE_TOP_K,
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[excel.es.search.failed] question=%r error=%s", question[:80], exc)
-            es_hits = []
-
     source_hits: list[tuple[str, list[dict[str, Any]]]] = [
         ("fts", fts_hits),
         ("vector", vector_hits),
     ]
-    if use_es:
-        source_hits.append(("elasticsearch", es_hits))
 
     return _rrf_merge(source_hits)[:top_k]
 
@@ -832,7 +774,6 @@ def build_excel_answer_request(
     document_id: int | None = None,
     base_url: str = DEFAULT_BASE_URL,
     max_history_messages: int = 8,
-    retrieval_backend: str | None = None,
 ) -> dict[str, Any] | None:
     filter_enums = get_excel_filter_enums(document_id) if document_id is not None else {}
     query_plan = classify_policy_query(question, base_url=base_url, filter_enums=filter_enums)
@@ -858,7 +799,6 @@ def build_excel_answer_request(
         document_id=document_id,
         filters=applied_filters,
         top_k=MAX_CONTEXT_CHUNKS,
-        backend=retrieval_backend,
     )
     logger.info("[excel.retrieve] question=%r filters=%s chunks=%d",
                 question[:80], applied_filters, len(chunks))

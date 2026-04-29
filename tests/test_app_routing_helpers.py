@@ -75,7 +75,6 @@ class AppRoutingHelperTests(unittest.TestCase):
                 question="查一下特采的流程",
                 conversation_history=[],
                 base_url="https://example.test/v1",
-                retrieval_backend=None,
             )
 
         self.assertEqual(result["request_kind"], "hybrid")

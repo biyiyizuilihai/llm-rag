@@ -20,8 +20,6 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 load_dotenv()
-
-import es_search
 from excel_qa import (
     build_excel_answer_request,
     build_excel_summary,
@@ -41,7 +39,6 @@ from pdf_qa import (
     extract_response_text,
     ocr_pipeline,
     render_pdf_to_jpegs,
-    retrieve_pages,
     usage_to_dict,
 )
 from storage import (
@@ -58,10 +55,8 @@ from storage import (
     get_document_by_sha,
     get_conversation,
     get_ocr_status,
-    get_page_ocr_text_map,
     init_db,
     latest_conversation_for_document,
-    list_excel_chunks_for_search_index,
     list_conversation_ids_for_document,
     list_conversation_documents,
     list_conversations,
@@ -175,12 +170,6 @@ class ConversationCreatePayload(BaseModel):
 class AskPayload(BaseModel):
     question: str = Field(min_length=1, max_length=8000)
     enable_thinking: bool = True
-    retrieval_backend: str | None = None
-
-
-class SearchComparePayload(BaseModel):
-    question: str = Field(min_length=1, max_length=8000)
-    document_id: int | None = None
 
 
 class ExcelConfigPayload(BaseModel):
@@ -304,7 +293,6 @@ def build_global_chat_request(
     conversation_history: list[dict[str, Any]],
     base_url: str = DEFAULT_BASE_URL,
     system_prompt: str = DOCUMENT_ASSISTANT_SYSTEM_PROMPT,
-    retrieval_backend: str | None = None,
 ) -> dict[str, Any]:
     with ThreadPoolExecutor(max_workers=2) as retrieval_executor:
         excel_future = retrieval_executor.submit(
@@ -313,7 +301,6 @@ def build_global_chat_request(
             conversation_history=conversation_history,
             document_id=None,
             base_url=base_url,
-            retrieval_backend=retrieval_backend,
         )
         pdf_future = retrieval_executor.submit(
             build_chat_request_multi,
@@ -570,10 +557,6 @@ def remove_document(document_id: int) -> dict:
     deleted = delete_document(document_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="文档不存在")
-    try:
-        es_search.delete_document(document.get("file_type") or "pdf", document_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("[document.es.delete.failed] document_id=%s error=%s", document_id, exc)
 
     if storage_path.exists():
         storage_path.unlink()
@@ -875,135 +858,6 @@ def configure_excel_document(document_id: int, payload: ExcelConfigPayload) -> d
     }
 
 
-@app.post("/api/documents/{document_id}/reindex-elasticsearch")
-def reindex_document_elasticsearch(document_id: int) -> dict[str, Any]:
-    document = get_document(document_id)
-    if not document:
-        raise HTTPException(status_code=404, detail="文档不存在")
-    ensure_document_index_ready(document)
-    if not es_search.enabled():
-        raise HTTPException(status_code=400, detail="未配置 ELASTICSEARCH_URL 或 OPENSEARCH_URL。")
-
-    try:
-        file_type = document.get("file_type") or "pdf"
-        es_search.delete_document(file_type, document_id)
-        if file_type == "excel":
-            indexed = es_search.index_excel_chunks(list_excel_chunks_for_search_index(document_id))
-        else:
-            indexed = es_search.index_pdf_pages(document, get_page_ocr_text_map(document_id))
-    except Exception as exc:
-        logger.exception("[document.es.reindex.failed] document_id=%s error=%s", document_id, exc)
-        raise HTTPException(status_code=500, detail=f"ES 重建失败：{exc}") from exc
-
-    return {
-        "document_id": document_id,
-        "file_type": document.get("file_type") or "pdf",
-        "indexed": indexed,
-    }
-
-
-def summarize_excel_request(search_request: dict[str, Any] | None) -> dict[str, Any]:
-    if not search_request:
-        return {"hit": False, "query_plan": None, "policies": [], "chunks": []}
-    return {
-        "hit": True,
-        "query_plan": search_request.get("query_plan"),
-        "policies": [
-            {
-                "title": policy.get("title"),
-                "source_row": policy.get("source_row"),
-                "chunk_indexes": [chunk.get("chunk_index") for chunk in policy.get("chunks", [])],
-                "snippets": [
-                    (chunk.get("chunk_text") or "").replace("\n", " ")[:300]
-                    for chunk in policy.get("chunks", [])[:3]
-                ],
-            }
-            for policy in search_request.get("policies", [])
-        ],
-        "chunks": [
-            {
-                "title": chunk.get("title"),
-                "source_row": chunk.get("source_row"),
-                "chunk_index": chunk.get("chunk_index"),
-                "retrieval_sources": chunk.get("retrieval_sources", []),
-                "score": chunk.get("rank"),
-                "snippet": (chunk.get("chunk_text") or "").replace("\n", " ")[:300],
-            }
-            for chunk in search_request.get("chunks", [])[:20]
-        ],
-    }
-
-
-@app.post("/api/search/compare")
-def compare_search(payload: SearchComparePayload) -> dict[str, Any]:
-    document = get_document(payload.document_id) if payload.document_id is not None else None
-    if payload.document_id is not None and not document:
-        raise HTTPException(status_code=404, detail="文档不存在")
-
-    question = payload.question.strip()
-    if document and document.get("file_type") == "excel":
-        ensure_document_index_ready(document)
-        sqlite_request = build_excel_answer_request(
-            question=question,
-            conversation_history=[],
-            document_id=int(document["id"]),
-            base_url=DEFAULT_BASE_URL,
-            retrieval_backend="sqlite",
-        )
-        es_request = build_excel_answer_request(
-            question=question,
-            conversation_history=[],
-            document_id=int(document["id"]),
-            base_url=DEFAULT_BASE_URL,
-            retrieval_backend="es",
-        )
-        return {
-            "kind": "excel",
-            "document_id": int(document["id"]),
-            "elasticsearch_enabled": es_search.enabled(),
-            "sqlite": summarize_excel_request(sqlite_request),
-            "elasticsearch": summarize_excel_request(es_request),
-        }
-
-    if document and document.get("file_type", "pdf") == "pdf":
-        ensure_document_index_ready(document)
-        sqlite_pages = retrieve_pages(question, int(document["id"]), int(document.get("page_count") or 0))
-        try:
-            es_pages = es_search.search_pdf_pages(question, document_id=int(document["id"]), top_k=16)
-        except Exception as exc:  # noqa: BLE001
-            es_pages = []
-            logger.warning("[search.compare.pdf.es.failed] document_id=%s error=%s", document["id"], exc)
-        return {
-            "kind": "pdf",
-            "document_id": int(document["id"]),
-            "elasticsearch_enabled": es_search.enabled(),
-            "sqlite": {"pages": sqlite_pages},
-            "elasticsearch": {"pages": es_pages},
-        }
-
-    sqlite_request = build_excel_answer_request(
-        question=question,
-        conversation_history=[],
-        document_id=None,
-        base_url=DEFAULT_BASE_URL,
-        retrieval_backend="sqlite",
-    )
-    es_request = build_excel_answer_request(
-        question=question,
-        conversation_history=[],
-        document_id=None,
-        base_url=DEFAULT_BASE_URL,
-        retrieval_backend="es",
-    )
-    return {
-        "kind": "excel_global",
-        "document_id": None,
-        "elasticsearch_enabled": es_search.enabled(),
-        "sqlite": summarize_excel_request(sqlite_request),
-        "elasticsearch": summarize_excel_request(es_request),
-    }
-
-
 @app.post("/api/conversations")
 def new_conversation(payload: ConversationCreatePayload) -> dict:
     document = None
@@ -1072,7 +926,6 @@ def stream_document(conversation_id: int, payload: AskPayload) -> StreamingRespo
                     conversation_history=history_messages,
                     document_id=int(bound_document["id"]),
                     base_url=DEFAULT_BASE_URL,
-                    retrieval_backend=payload.retrieval_backend,
                 )
                 if not excel_request:
                     yield event_line({"type": "error", "detail": "当前 Excel 中未检索到相关政策片段。"})
@@ -1098,7 +951,6 @@ def stream_document(conversation_id: int, payload: AskPayload) -> StreamingRespo
                     conversation_history=history_messages,
                     base_url=DEFAULT_BASE_URL,
                     system_prompt=DOCUMENT_ASSISTANT_SYSTEM_PROMPT,
-                    retrieval_backend=payload.retrieval_backend,
                 )
                 client = global_request["client"]
                 messages = global_request["messages"]
@@ -1312,7 +1164,6 @@ def ask_document(conversation_id: int, payload: AskPayload) -> dict:
                 conversation_history=history_messages,
                 document_id=int(bound_document["id"]),
                 base_url=DEFAULT_BASE_URL,
-                retrieval_backend=payload.retrieval_backend,
             )
             if not excel_request:
                 raise ValueError("当前 Excel 中未检索到相关政策片段。")
@@ -1322,7 +1173,6 @@ def ask_document(conversation_id: int, payload: AskPayload) -> dict:
                 conversation_history=history_messages,
                 base_url=DEFAULT_BASE_URL,
                 system_prompt=DOCUMENT_ASSISTANT_SYSTEM_PROMPT,
-                retrieval_backend=payload.retrieval_backend,
             )
             client = global_request["client"]
             messages = global_request["messages"]

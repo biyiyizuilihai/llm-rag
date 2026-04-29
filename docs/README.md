@@ -13,11 +13,10 @@ The frontend is served from `static/`. Runtime files live in `data/` and should 
 
 ## Key Files
 
-- `app.py`: FastAPI routes, upload APIs, conversation APIs, streaming response handling, OpenSearch compare endpoints.
+- `app.py`: FastAPI routes, upload APIs, conversation APIs, and streaming response handling.
 - `pdf_qa.py`: PDF OCR/retrieval/embedding helpers and LLM request construction.
 - `excel_qa.py`: Excel parsing, field config normalization, policy row indexing, chunking, query classification, Excel retrieval, and LLM context construction.
 - `storage.py`: SQLite schema, FTS tables, sqlite-vec vector tables, documents/conversations/messages persistence.
-- `es_search.py`: optional Elasticsearch/OpenSearch indexing and search helpers for A/B comparison.
 - `static/app.js`: frontend state management, uploads, Excel config modal, chat streaming, and PDF.js integration.
 - `static/app.css`: frontend styling.
 - `requirements.txt`: Python dependencies, including `xlrd`, `openpyxl`, and `sqlite-vec`.
@@ -47,7 +46,7 @@ curl -s http://127.0.0.1:8001/api/health
 Syntax check after edits:
 
 ```bash
-.venv/bin/python -m py_compile app.py pdf_qa.py excel_qa.py storage.py es_search.py
+.venv/bin/python -m py_compile app.py pdf_qa.py excel_qa.py storage.py
 ```
 
 ## Excel Ingestion Flow
@@ -68,7 +67,6 @@ Syntax check after edits:
 8. Chunks are stored in `excel_policy_chunks`.
 9. SQLite FTS index is populated for keyword search.
 10. If embedding is available, chunk vectors are stored in `excel_policy_chunk_vec` plus `excel_chunk_vec_map`.
-11. Optional OpenSearch indexing can be triggered for A/B comparison.
 
 Current policy Excel test file:
 
@@ -102,19 +100,9 @@ user question
 
 Important current behavior:
 
-- Elasticsearch/OpenSearch is **not** part of the official answer path.
-- ES is only for `/api/search/compare` A/B diagnostics.
 - The current official retrieval strategy is intentionally simple: FTS and vector results are unioned, not weighted.
 - Neighbor chunks are marked with `retrieval_sources: ["neighbor"]`.
 - Direct hits expose `retrieval_sources` such as `fts` or `vector`.
-
-Useful comparison endpoint:
-
-```bash
-curl -s -X POST http://127.0.0.1:8001/api/search/compare \
-  -H 'Content-Type: application/json' \
-  -d '{"document_id":11,"question":"E类人才有没有相关的生活政策"}'
-```
 
 ## Query Classification
 
@@ -163,16 +151,6 @@ upload PDF
 ```
 
 PDF logic mainly lives in `pdf_qa.py`, while persistence lives in `storage.py`. The frontend uses bundled PDF.js under `static/pdfjs/`.
-
-## OpenSearch / Elasticsearch
-
-OpenSearch integration is optional and used for diagnostics:
-
-- `es_search.py` manages index creation/search.
-- `/api/documents/{document_id}/reindex-elasticsearch` reindexes a document into ES.
-- `/api/search/compare` returns SQLite/official retrieval side-by-side with ES.
-
-Do not mix ES into the production answer path unless product requirements explicitly change. Earlier experiments showed ES can help some Chinese queries but can also overmatch broad terms like `机构` or `人才`.
 
 ## Current Known Problems
 
@@ -273,8 +251,6 @@ SILICONFLOW_EMBEDDING_URL
 SILICONFLOW_EMBEDDING_MODEL
 PADDLEOCR_TOKEN
 EXCEL_QUERY_CLASSIFIER_MODEL
-ELASTICSEARCH_URL
-ELASTICSEARCH_INDEX_PREFIX
 ```
 
 Keep real credentials in `.env` only. Do not commit them.
@@ -307,4 +283,3 @@ For each question, inspect:
 - `sqlite.policies`
 - `sqlite.chunks[].retrieval_sources`
 - whether the final answer ignores irrelevant candidate policies
-
