@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .DS_Store
+.idea/
 .venv/
 .env
 .env.local
@@ -11,3 +12,4 @@ CLAUDE.md
 data/app.db
 data/uploads/
 data/renders/
+langgraph/data/

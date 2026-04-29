@@ -1,12 +1,46 @@
 # Repository Guidelines
 
+## Project Overview
+
+This repository is a local document question-answering workbench built with FastAPI and a framework-free web frontend. It supports PDF upload/OCR/indexing, Excel policy-library ingestion, retrieval-augmented chat, streaming model responses, document routing, and source navigation back to the original PDF pages.
+
+Core runtime flow:
+
+1. Users upload a PDF or Excel file through the vanilla frontend in `static/`.
+2. `app.py` stores the file under `data/uploads/`, creates a document record, and creates or reuses a conversation.
+3. PDF files are rendered to page JPEGs under `data/renders/`, then queued for the background OCR/indexing pipeline in `pdf_qa.py`.
+4. Excel files are previewed first; after field configuration, `excel_qa.py` converts rows into policy records and searchable chunks.
+5. `storage.py` persists documents, conversations, OCR text, Excel chunks, FTS rows, optional sqlite-vec vector rows, and route profiles in SQLite.
+6. Optional `es_search.py` integration mirrors PDF pages and Excel chunks into Elasticsearch/OpenSearch for comparison or alternative retrieval.
+7. Chat requests build a small retrieval context from relevant PDF pages or Excel chunks, call the DashScope-compatible LLM API, stream answer deltas to the browser, then persist messages and source metadata.
+
+Primary capabilities:
+
+- PDF page rendering, asynchronous PaddleOCR indexing, retry handling, and per-page OCR progress.
+- SQLite FTS5 plus optional sqlite-vec hybrid retrieval for PDF pages, document profiles, and Excel chunks.
+- Multi-document routing using explicit title matches, document profile FTS, and optional vector similarity.
+- Excel policy-library ingestion with configurable title/content/filter/source fields and chunking.
+- Optional Elasticsearch/OpenSearch indexing and `/api/search/compare` retrieval diagnostics.
+- Streaming chat with reasoning deltas, answer deltas, usage summaries, source-page metadata, and PDF.js page navigation.
+
+Important runtime directories and data:
+
+- `data/app.db`: SQLite database for documents, conversations, messages, OCR text, FTS state, vector maps, profiles, and Excel policy chunks.
+- `data/uploads/`: uploaded source files. Treat as sensitive runtime data.
+- `data/renders/`: rendered PDF page images and LLM-optimized image cache. Treat as generated runtime data.
+- `tmp/`: disposable sample PDFs and scratch files for local manual testing.
+
+External services are configured through `.env`: DashScope-compatible chat (`DASHSCOPE_API_KEY`), PaddleOCR async jobs (`PADDLEOCR_TOKEN`), SiliconFlow embeddings (`SILICONFLOW_API_KEY`), and optional Elasticsearch/OpenSearch settings.
+
 ## Project Structure & Module Organization
 
-This repository is a local PDF question-answering service built with FastAPI.
+This repository is a local document question-answering service built with FastAPI.
 
 - `app.py`: FastAPI application, routes, streaming chat APIs, static mounts, and OCR job orchestration.
 - `pdf_qa.py`: PDF rendering, OCR pipeline, retrieval, embeddings, document routing, and LLM request construction.
 - `storage.py`: SQLite schema, FTS/vector storage helpers, conversations, documents, and OCR status records.
+- `excel_qa.py`: Excel preview, field configuration, policy chunking, hybrid retrieval, and answer request construction.
+- `es_search.py`: optional Elasticsearch/OpenSearch index setup, document deletion, bulk indexing, and search helpers.
 - `static/`: Vanilla frontend assets. `static/app.js` drives the UI; `static/pdfjs/` contains bundled PDF.js viewer files.
 - `data/`: Runtime database, uploads, and render cache. Do not commit generated contents.
 - `tmp/`: Local sample PDFs and scratch files. Treat as disposable test data.

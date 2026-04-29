@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -9,7 +10,7 @@ from typing import Any
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = Path(os.environ.get("LLM_RAG_DATA_DIR") or (BASE_DIR / "data")).expanduser().resolve()
 UPLOADS_DIR = DATA_DIR / "uploads"
 RENDERS_DIR = DATA_DIR / "renders"
 DB_PATH = DATA_DIR / "app.db"
