@@ -1,0 +1,14 @@
+.git
+.venv
+__pycache__
+*.pyc
+.DS_Store
+.idea
+.qwen
+.env
+.env.local
+tmp
+langgraph
+data
+*.xls
+*.xlsx

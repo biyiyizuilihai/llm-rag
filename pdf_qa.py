@@ -41,8 +41,11 @@ from storage import (
 
 load_dotenv()
 
-DEFAULT_MODEL = "qwen3.5-35b-a3b"
-DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_MODEL = os.environ.get("LLM_MODEL", "qwen3.5-35b-a3b")
+DEFAULT_BASE_URL = os.environ.get(
+    "LLM_BASE_URL",
+    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+)
 MODEL_CONTEXT_WINDOWS = {
     "qwen3.5-35b-a3b": 262_144,
 }
@@ -1236,11 +1239,11 @@ def build_chat_messages(
 
 
 def build_openai_client(base_url: str = DEFAULT_BASE_URL) -> OpenAI:
-    api_key = os.environ.get("DASHSCOPE_API_KEY")
+    api_key = os.environ.get("LLM_API_KEY") or os.environ.get("DASHSCOPE_API_KEY")
     if not api_key:
-        raise EnvironmentError("请先设置环境变量 DASHSCOPE_API_KEY")
+        raise EnvironmentError("请先设置环境变量 LLM_API_KEY 或 DASHSCOPE_API_KEY")
     logger.info(
-        "[dashscope] create client base_url=%s api_key_len=%s",
+        "[llm] create client base_url=%s api_key_len=%s",
         base_url,
         len(api_key),
     )

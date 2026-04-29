@@ -1,0 +1,13 @@
+services:
+  llm-rag:
+    build: .
+    container_name: llm-rag
+    env_file:
+      - .env
+    environment:
+      LLM_RAG_DATA_DIR: /app/data
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

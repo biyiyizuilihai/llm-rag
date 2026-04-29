@@ -63,6 +63,40 @@ def ensure_storage() -> None:
     RENDERS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def normalize_document_runtime_paths(conn: sqlite3.Connection) -> int:
+    try:
+        rows = conn.execute("SELECT id, storage_path, render_dir FROM documents").fetchall()
+    except sqlite3.OperationalError:
+        return 0
+
+    changed = 0
+    for row in rows:
+        updates: dict[str, str] = {}
+        storage_path = str(row["storage_path"] or "")
+        if storage_path:
+            expected_storage_path = UPLOADS_DIR / Path(storage_path).name
+            if expected_storage_path.exists() and storage_path != str(expected_storage_path):
+                updates["storage_path"] = str(expected_storage_path)
+
+        render_dir = str(row["render_dir"] or "")
+        if render_dir:
+            expected_render_dir = RENDERS_DIR / Path(render_dir).name
+            if expected_render_dir.exists() and render_dir != str(expected_render_dir):
+                updates["render_dir"] = str(expected_render_dir)
+
+        if not updates:
+            continue
+
+        assignments = ", ".join(f"{column} = ?" for column in updates)
+        conn.execute(
+            f"UPDATE documents SET {assignments} WHERE id = ?",
+            (*updates.values(), int(row["id"])),
+        )
+        changed += 1
+
+    return changed
+
+
 def _warn_sqlite_vec_once(message: str) -> None:
     global _SQLITE_VEC_WARNED
     if _SQLITE_VEC_WARNED:
@@ -360,6 +394,7 @@ def init_db() -> None:
                 USING vec0(embedding FLOAT[1024])
                 """
             )
+        normalize_document_runtime_paths(conn)
 
 
 def _document_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
