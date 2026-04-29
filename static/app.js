@@ -9,6 +9,7 @@ const state = {
   activeDocumentId: null,
   activeConversationId: null,
   isSubmitting: false,
+  currentStreamAbortController: null,
   pendingImages: [],
   pdfPanel: {
     visible: false,
@@ -34,12 +35,15 @@ const state = {
 const refs = {}
 let workspaceRenderQueued = false
 let mermaidRenderQueued = false
+let mermaidLoadPromise = null
+let mermaidInitialized = false
 let shouldAutoScroll = true
 let pendingWaitTickerId = null
 const activeOcrPolls = new Set()
 const AUTO_SCROLL_THRESHOLD = 48
 const PDF_DRAWER_MIN_WIDTH = 560
 const PDF_DRAWER_MAX_WIDTH = 960
+const MERMAID_SCRIPT_URL = "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"
 const PAGE_REF_PATTERN = /第\s*(\d+)\s*(?:[–\-~至]\s*(\d+)\s*)?页|\[(\d+)(?:\s*[–\-~至]\s*(\d+))?\]|[Pp](?:age)?\.?\s*(\d+)(?:\s*[–\-~]\s*(\d+))?/g
 
 function persistStateToHash() {
@@ -238,6 +242,10 @@ function bindEvents() {
   })
 
   refs.sendButton.addEventListener("click", async () => {
+    if (state.isSubmitting) {
+      stopCurrentStream()
+      return
+    }
     await sendQuestion()
   })
 
@@ -311,8 +319,19 @@ function configureMarkdown() {
     })
   }
 
-  if (window.mermaid?.initialize) {
+  initializeMermaid()
+}
+
+function initializeMermaid() {
+  if (mermaidInitialized || !window.mermaid?.initialize) {
+    return
+  }
+
+  try {
     window.mermaid.initialize({ startOnLoad: false, theme: "neutral" })
+    mermaidInitialized = true
+  } catch (error) {
+    console.error(error)
   }
 }
 
@@ -1619,15 +1638,23 @@ async function sendQuestion() {
   autoResizeTextarea()
 
   state.isSubmitting = true
+  const abortController = new AbortController()
+  state.currentStreamAbortController = abortController
   state.messages = [...state.messages, tempUser, tempAssistant]
   shouldAutoScroll = true
   renderWorkspace()
   scrollMessagesToBottom(true)
+  syncComposerState()
   setStatusLine("正在处理你的问题。", "info")
 
   try {
-    await streamConversation(question, tempUserId, tempAssistantId)
+    await streamConversation(question, tempUserId, tempAssistantId, abortController.signal)
   } catch (error) {
+    if (isAbortError(error)) {
+      markAssistantMessageStopped(tempAssistantId)
+      setStatusLine("已暂停本轮回答。", "info")
+      return
+    }
     console.error(error)
     const errorMsg = error.message || "发送失败。"
     const tempAssistant = state.messages.find((m) => m.id === tempAssistantId)
@@ -1639,11 +1666,45 @@ async function sendQuestion() {
     setStatusLine(errorMsg, "error")
   } finally {
     state.isSubmitting = false
+    if (state.currentStreamAbortController === abortController) {
+      state.currentStreamAbortController = null
+    }
     syncComposerState()
   }
 }
 
-async function streamConversation(question, tempUserId, tempAssistantId) {
+function stopCurrentStream() {
+  const controller = state.currentStreamAbortController
+  if (!controller || controller.signal.aborted) {
+    return
+  }
+  setStatusLine("正在暂停本轮回答。", "info")
+  controller.abort()
+}
+
+function isAbortError(error) {
+  return error?.name === "AbortError"
+}
+
+function markAssistantMessageStopped(tempAssistantId) {
+  const tempAssistant = state.messages.find((message) => message.id === tempAssistantId)
+  if (!tempAssistant) {
+    renderWorkspace()
+    return
+  }
+
+  tempAssistant.pending = false
+  tempAssistant.is_stopped = true
+  tempAssistant.progress_stage = "已暂停"
+  tempAssistant.progress_detail = "本轮回答已由用户暂停。"
+  if (!tempAssistant.content.trim()) {
+    tempAssistant.content = "已暂停本轮回答。"
+  }
+  tempAssistant.thinking_expanded = Boolean(tempAssistant.thinking_text)
+  renderWorkspace()
+}
+
+async function streamConversation(question, tempUserId, tempAssistantId, signal) {
   const response = await fetch(`/api/conversations/${state.activeConversationId}/stream`, {
     method: "POST",
     headers: {
@@ -1653,6 +1714,7 @@ async function streamConversation(question, tempUserId, tempAssistantId) {
       question,
       enable_thinking: refs.thinkingToggle.checked,
     }),
+    signal,
   })
 
   if (!response.ok) {
@@ -2347,11 +2409,45 @@ function patchUnclosedFences(content) {
   return `${content}\n\`\`\``
 }
 
+function ensureMermaidLoaded() {
+  if (window.mermaid?.init) {
+    initializeMermaid()
+    return Promise.resolve()
+  }
+
+  if (mermaidLoadPromise) {
+    return mermaidLoadPromise
+  }
+
+  mermaidLoadPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script")
+    script.src = MERMAID_SCRIPT_URL
+    script.async = true
+    script.onload = () => {
+      initializeMermaid()
+      resolve()
+    }
+    script.onerror = () => {
+      mermaidLoadPromise = null
+      reject(new Error("Mermaid 加载失败。"))
+    }
+    document.head.appendChild(script)
+  })
+
+  return mermaidLoadPromise
+}
+
 function scheduleMermaidRender() {
   if (!window.mermaid?.init || mermaidRenderQueued) {
+    if (!window.mermaid?.init) {
+      ensureMermaidLoaded()
+        .then(() => scheduleMermaidRender())
+        .catch((error) => console.error(error))
+    }
     return
   }
 
+  initializeMermaid()
   mermaidRenderQueued = true
   window.requestAnimationFrame(() => {
     mermaidRenderQueued = false
@@ -2451,9 +2547,13 @@ function syncComposerState() {
   const mode = currentMode()
   const readyToChat = hasAnyQueryableDocument()
   const hasQuestion = Boolean(refs.questionInput.value.trim())
+  const isStreaming = state.isSubmitting && Boolean(state.currentStreamAbortController)
 
   refs.questionInput.disabled = !readyToChat || state.isSubmitting
-  refs.sendButton.disabled = !readyToChat || state.isSubmitting || !hasQuestion
+  refs.sendButton.disabled = isStreaming ? false : !readyToChat || state.isSubmitting || !hasQuestion
+  refs.sendButton.textContent = isStreaming ? "暂停" : "发送"
+  refs.sendButton.classList.toggle("send-button--stop", isStreaming)
+  refs.sendButton.setAttribute("aria-label", isStreaming ? "暂停本轮回答" : "发送问题")
   refs.globalChatButton.disabled = state.isSubmitting
   refs.singleChatButton.disabled = state.isSubmitting || !state.documents.length
   refs.uploadButton.disabled = state.isSubmitting

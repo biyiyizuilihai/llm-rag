@@ -208,8 +208,8 @@ RETRIEVAL_ALIAS_MAP = {
 QUERY_UNDERSTANDING_MAX_TOKENS = 256
 DOCUMENT_PROFILE_MAX_TOKENS = 384
 DOCUMENT_ROUTING_TOP_K = 5
-MULTI_DOC_TOTAL_PAGE_BUDGET = 12
-MULTI_DOC_PER_DOC_PAGE_LIMIT = 4
+MULTI_DOC_TOTAL_PAGE_BUDGET = 15
+MULTI_DOC_PER_DOC_PAGE_LIMIT = 6
 DOCUMENT_PROFILE_SYSTEM_PROMPT = """You are a document profiler for multilingual PDF routing.
 Return a single JSON object only.
 
@@ -740,12 +740,14 @@ def score_keyword_match_pages(
         for chunk in CJK_QUERY_CHUNK_PATTERN.findall(str(question or ""))
         if len(chunk) >= 2
     }
+    folded_source_chunks = [chunk.casefold() for chunk in source_chunks]
     for page_number, page_text in page_text_map.items():
         text = str(page_text or "")
         if not text:
             continue
 
-        matched_terms = [term for term in terms if term in text]
+        folded_text = text.casefold()
+        matched_terms = [term for term in terms if term.casefold() in folded_text]
         if not matched_terms:
             continue
 
@@ -760,7 +762,7 @@ def score_keyword_match_pages(
             seen_matches.add(key)
             unique_matches.append(term)
             score += min(6, max(1, len(term)))
-            if any(term in chunk or chunk in term for chunk in source_chunks):
+            if any(key in chunk or chunk in key for chunk in folded_source_chunks):
                 source_hit_count += 1
 
         score += min(8, len(unique_matches) * 2)

@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shutil
+from copy import deepcopy
 from typing import Any
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -149,6 +150,23 @@ DOCUMENT_ASSISTANT_SYSTEM_PROMPT = """你是一位专业的文档分析助手，
 - 流程类 / 规范类问题：完整列出所有步骤和条件，宁可详细也不能遗漏
 - 对比类问题：必须用表格，每个维度都要填满，不留空白格"""
 
+HYBRID_RETRIEVAL_PROMPT_APPENDIX = """
+
+## 全局双路检索使用规则
+
+你可能同时看到两类候选证据：
+
+- **PDF 页面图片**：通常来自程序文件、规范、附件、图表、扫描件，适合回答文件内容、Attachment / Appendix / Section、流程、翻译、表格或页面细节问题。
+- **Excel 政策片段**：通常来自结构化政策库，适合回答申报、补贴、奖励、园区、企业条件、认定条件等政策问题。
+
+这些证据都是候选材料，不代表都和问题相关。回答前必须先判断用户问题实际需要哪类来源：
+
+1. 如果问题明确提到文件名、附件名、页码、Attachment、Appendix、Section，或要求翻译某段内容，优先使用对应 PDF 页面；Excel 只在直接补充同一问题时使用。
+2. 如果问题明显是在问政策、申报、补贴、奖励、园区、企业条件或认定条件，优先使用 Excel 政策片段；PDF 只在直接补充同一问题时使用。
+3. 如果 PDF 和 Excel 证据主题不一致，忽略不相关来源，不要为了覆盖来源而强行混合。
+4. 回答中按来源标注依据：PDF 写“文件名 第 N 页”；Excel 写政策标题、发文字号或来源行。
+5. 如果候选材料不足以支持答案，明确说明未找到依据，不要猜测。"""
+
 
 class ConversationCreatePayload(BaseModel):
     document_id: int | None = None
@@ -223,6 +241,146 @@ def attach_answer_source_urls(answer_sources: list[dict]) -> list[dict]:
         attached = attach_pdf_url(document) or {}
         enriched.append({**source, "pdf_url": attached.get("pdf_url", "")})
     return enriched
+
+
+def has_excel_retrieval_context(excel_request: dict[str, Any] | None) -> bool:
+    """Return whether a global Excel preflight actually found usable evidence."""
+    return bool(excel_request and excel_request.get("policies"))
+
+
+def apply_hybrid_retrieval_prompt(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged = deepcopy(messages)
+    for message in merged:
+        if message.get("role") == "system" and isinstance(message.get("content"), str):
+            if HYBRID_RETRIEVAL_PROMPT_APPENDIX not in message["content"]:
+                message["content"] = message["content"].rstrip() + HYBRID_RETRIEVAL_PROMPT_APPENDIX
+            return merged
+    return [
+        {"role": "system", "content": DOCUMENT_ASSISTANT_SYSTEM_PROMPT + HYBRID_RETRIEVAL_PROMPT_APPENDIX},
+        *merged,
+    ]
+
+
+def merge_excel_context_into_pdf_messages(
+    messages: list[dict[str, Any]],
+    excel_request: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if not has_excel_retrieval_context(excel_request):
+        return messages
+
+    excel_messages = excel_request.get("messages") or []
+    excel_context = ""
+    for message in reversed(excel_messages):
+        if message.get("role") == "user" and isinstance(message.get("content"), str):
+            excel_context = message["content"]
+            break
+    if not excel_context:
+        return messages
+
+    merged = deepcopy(messages)
+    excel_block = {
+        "type": "text",
+        "text": (
+            "以下是 Excel 政策库并行检索到的候选片段。"
+            "这些片段可能与 PDF 页面证据无关；请按系统提示先判断来源相关性，"
+            "只使用和问题直接相关的内容。\n\n"
+            f"{excel_context}"
+        ),
+    }
+    for message in reversed(merged):
+        if message.get("role") != "user" or not isinstance(message.get("content"), list):
+            continue
+        content = message["content"]
+        insert_at = len(content)
+        if content and isinstance(content[-1], dict) and str(content[-1].get("text", "")).startswith("用户问题："):
+            insert_at = len(content) - 1
+        content.insert(insert_at, excel_block)
+        return merged
+    return merged
+
+
+def build_global_chat_request(
+    question: str,
+    conversation_history: list[dict[str, Any]],
+    base_url: str = DEFAULT_BASE_URL,
+    system_prompt: str = DOCUMENT_ASSISTANT_SYSTEM_PROMPT,
+    retrieval_backend: str | None = None,
+) -> dict[str, Any]:
+    with ThreadPoolExecutor(max_workers=2) as retrieval_executor:
+        excel_future = retrieval_executor.submit(
+            build_excel_answer_request,
+            question=question,
+            conversation_history=conversation_history,
+            document_id=None,
+            base_url=base_url,
+            retrieval_backend=retrieval_backend,
+        )
+        pdf_future = retrieval_executor.submit(
+            build_chat_request_multi,
+            question=question,
+            conversation_history=conversation_history,
+            base_url=base_url,
+            system_prompt=system_prompt,
+        )
+
+        excel_request: dict[str, Any] | None = None
+        pdf_result = None
+        excel_error: Exception | None = None
+        pdf_error: Exception | None = None
+        try:
+            excel_request = excel_future.result()
+        except Exception as exc:  # noqa: BLE001
+            excel_error = exc
+            logger.warning("[chat.global.excel_error] question=%r error=%s", question_excerpt(question), exc)
+        try:
+            pdf_result = pdf_future.result()
+        except Exception as exc:  # noqa: BLE001
+            pdf_error = exc
+            logger.warning("[chat.global.pdf_error] question=%r error=%s", question_excerpt(question), exc)
+
+    has_excel_context = has_excel_retrieval_context(excel_request)
+    if pdf_result and has_excel_context:
+        client, messages, page_images, pdf_documents, pdf_sources = pdf_result
+        return {
+            "request_kind": "hybrid",
+            "client": client,
+            "messages": apply_hybrid_retrieval_prompt(
+                merge_excel_context_into_pdf_messages(messages, excel_request)
+            ),
+            "page_images": page_images,
+            "routed_documents": [*pdf_documents, *(excel_request.get("routed_documents") or [])],
+            "answer_sources": [*pdf_sources, *(excel_request.get("answer_sources") or [])],
+            "policies": excel_request.get("policies") or [],
+        }
+
+    if pdf_result:
+        client, messages, page_images, routed_documents, answer_sources = pdf_result
+        return {
+            "request_kind": "pdf",
+            "client": client,
+            "messages": messages,
+            "page_images": page_images,
+            "routed_documents": routed_documents,
+            "answer_sources": answer_sources,
+            "policies": [],
+        }
+
+    if has_excel_context:
+        return {
+            "request_kind": "excel",
+            "client": excel_request["client"],
+            "messages": excel_request["messages"],
+            "page_images": [],
+            "routed_documents": excel_request.get("routed_documents") or [],
+            "answer_sources": excel_request.get("answer_sources") or [],
+            "policies": excel_request.get("policies") or [],
+        }
+
+    if pdf_error:
+        raise pdf_error
+    if excel_error:
+        raise excel_error
+    raise ValueError("Excel 与 PDF 均未检索到可用上下文。")
 
 
 def log_background_exception(future: Future) -> None:
@@ -902,6 +1060,7 @@ def stream_document(conversation_id: int, payload: AskPayload) -> StreamingRespo
                 if conversation.get("document_id")
                 else None
             )
+            global_context_ready = False
             if bound_document and bound_document.get("file_type") == "excel":
                 ensure_document_index_ready(bound_document)
                 yield progress_line(
@@ -931,31 +1090,28 @@ def stream_document(conversation_id: int, payload: AskPayload) -> StreamingRespo
                 policies = excel_request["policies"]
             elif not bound_document:
                 yield progress_line(
-                    "正在检索 Excel 索引",
-                    "正在优先尝试 Excel 政策库检索。",
+                    "正在并行检索",
+                    "正在同时检索 Excel 政策片段和 PDF 页面上下文。",
                 )
-                excel_request = build_excel_answer_request(
+                global_request = build_global_chat_request(
                     question=question,
                     conversation_history=history_messages,
-                    document_id=None,
                     base_url=DEFAULT_BASE_URL,
+                    system_prompt=DOCUMENT_ASSISTANT_SYSTEM_PROMPT,
                     retrieval_backend=payload.retrieval_backend,
                 )
-                if excel_request:
-                    yield progress_line(
-                        "正在整理 Excel 命中上下文",
-                        f"已选出 {len(excel_request['policies'])} 条候选政策。",
-                    )
-                    client = excel_request["client"]
-                    messages = excel_request["messages"]
-                    routed_documents = excel_request["routed_documents"]
-                    answer_sources = excel_request["answer_sources"]
-                    page_images = []
-                    request_kind = "excel"
-                    policies = excel_request["policies"]
-                else:
-                    request_kind = "pdf"
-                    policies = []
+                client = global_request["client"]
+                messages = global_request["messages"]
+                page_images = global_request["page_images"]
+                routed_documents = global_request["routed_documents"]
+                answer_sources = attach_answer_source_urls(global_request["answer_sources"])
+                request_kind = global_request["request_kind"]
+                policies = global_request["policies"]
+                global_context_ready = True
+                yield progress_line(
+                    "正在整理双路命中上下文",
+                    f"已选出 {len(policies)} 条 Excel 候选政策、{len(page_images)} 页 PDF 上下文。",
+                )
             else:
                 request_kind = "pdf"
                 policies = []
@@ -964,7 +1120,7 @@ def stream_document(conversation_id: int, payload: AskPayload) -> StreamingRespo
                 "正在处理用户问题",
                 "正在分析问题并准备检索上下文。",
             )
-            if request_kind == "pdf":
+            if request_kind == "pdf" and not global_context_ready:
                 yield progress_line(
                     "正在执行文档路由",
                     "正在筛选最可能相关的候选文档。",
@@ -1161,15 +1317,25 @@ def ask_document(conversation_id: int, payload: AskPayload) -> dict:
             if not excel_request:
                 raise ValueError("当前 Excel 中未检索到相关政策片段。")
         elif not bound_document:
-            excel_request = build_excel_answer_request(
+            global_request = build_global_chat_request(
                 question=question,
                 conversation_history=history_messages,
-                document_id=None,
                 base_url=DEFAULT_BASE_URL,
+                system_prompt=DOCUMENT_ASSISTANT_SYSTEM_PROMPT,
                 retrieval_backend=payload.retrieval_backend,
             )
+            client = global_request["client"]
+            messages = global_request["messages"]
+            page_images = global_request["page_images"]
+            routed_documents = global_request["routed_documents"]
+            answer_sources = attach_answer_source_urls(global_request["answer_sources"])
+            request_kind = global_request["request_kind"]
+            policies = global_request["policies"]
 
-        if excel_request:
+        use_excel_request = bound_document is not None and bool(excel_request) and (
+            bound_document is not None or has_excel_retrieval_context(excel_request)
+        )
+        if use_excel_request:
             client = excel_request["client"]
             messages = excel_request["messages"]
             page_images: list[dict[str, Any]] = []
@@ -1177,7 +1343,13 @@ def ask_document(conversation_id: int, payload: AskPayload) -> dict:
             answer_sources = excel_request["answer_sources"]
             request_kind = "excel"
             policies = excel_request["policies"]
-        else:
+        elif bound_document is not None:
+            if excel_request:
+                logger.info(
+                    "[chat.sync.excel_fallback] conversation_id=%s question=%r reason=no_excel_context",
+                    conversation_id,
+                    question_excerpt(question, limit=80),
+                )
             client, messages, page_images, routed_documents, answer_sources = build_chat_request_multi(
                 question=question,
                 conversation_history=history_messages,

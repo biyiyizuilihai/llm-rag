@@ -451,6 +451,15 @@ button {
   background: #3b8cff;
 }
 
+.send-button--stop {
+  background: #dc2626;
+  color: #ffffff;
+}
+
+.send-button--stop:hover {
+  background: #b91c1c;
+}
+
 .doc-action--warn {
   border: 1px solid transparent;
   background: #f59e0b;
