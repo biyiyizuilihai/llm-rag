@@ -212,6 +212,7 @@ DOCUMENT_PROFILE_MAX_TOKENS = 384
 DOCUMENT_ROUTING_TOP_K = 5
 MULTI_DOC_TOTAL_PAGE_BUDGET = 15
 MULTI_DOC_PER_DOC_PAGE_LIMIT = 6
+MULTI_DOC_SINGLE_DOC_PAGE_LIMIT = 30
 DOCUMENT_PROFILE_SYSTEM_PROMPT = """You are a document profiler for multilingual PDF routing.
 Return a single JSON object only.
 
@@ -2244,15 +2245,19 @@ def retrieve_multi_document_context(
     per_doc_page_limit: int = MULTI_DOC_PER_DOC_PAGE_LIMIT,
 ) -> list[dict[str, Any]]:
     context_sources: list[dict[str, Any]] = []
+    single_document = len(routed_documents) == 1
+    effective_per_doc_limit = MULTI_DOC_SINGLE_DOC_PAGE_LIMIT if single_document else per_doc_page_limit
+    effective_total_budget = max(total_page_budget, effective_per_doc_limit) if single_document else total_page_budget
     for rank_index, document in enumerate(routed_documents, start=1):
         pages = retrieve_pages(
             question=question,
             document_id=int(document["id"]),
             total_pages=int(document["page_count"]),
+            max_pages=effective_per_doc_limit,
         )
         if not pages:
             continue
-        for local_rank, page_number in enumerate(pages[:per_doc_page_limit], start=1):
+        for local_rank, page_number in enumerate(pages[:effective_per_doc_limit], start=1):
             context_sources.append(
                 {
                     "document_id": int(document["id"]),
@@ -2260,7 +2265,7 @@ def retrieve_multi_document_context(
                     "document_display_name": document.get("display_name") or document.get("file_name") or "",
                     "page_number": int(page_number),
                     "rank": rank_index,
-                    "score": max(1, per_doc_page_limit - local_rank + 1),
+                    "score": max(1, effective_per_doc_limit - local_rank + 1),
                     "pdf_url": document.get("pdf_url") or "",
                     "render_dir": document.get("render_dir") or "",
                 }
@@ -2274,7 +2279,7 @@ def retrieve_multi_document_context(
             int(item.get("page_number", 0)),
         ),
     )
-    return ordered[:total_page_budget]
+    return ordered[:effective_total_budget]
 
 
 def build_chat_request_multi(
