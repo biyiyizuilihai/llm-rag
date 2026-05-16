@@ -465,12 +465,17 @@ def conversation_detail(conversation_id: int) -> dict:
         raise HTTPException(status_code=404, detail="会话不存在")
 
     document_id = conversation.get("document_id")
-    document = get_document(int(document_id)) if document_id else None
+    routed_documents = list_conversation_documents(conversation_id)
+    document = (
+        get_document(int(document_id))
+        if document_id
+        else (routed_documents[0] if routed_documents else None)
+    )
     messages = list_messages(conversation_id)
     return {
         "conversation": conversation,
         "document": attach_pdf_url(document),
-        "routed_documents": attach_pdf_urls(list_conversation_documents(conversation_id)),
+        "routed_documents": attach_pdf_urls(routed_documents),
         "messages": messages,
     }
 
@@ -492,7 +497,7 @@ def remove_conversation(conversation_id: int) -> dict[str, int | None]:
 
 
 @app.get("/api/documents/{document_id}/ocr-status")
-def ocr_status(document_id: int) -> dict[str, str | int]:
+def ocr_status(document_id: int) -> dict[str, Any]:
     document = get_document(document_id)
     if not document:
         raise HTTPException(status_code=404, detail="文档不存在")
@@ -501,6 +506,7 @@ def ocr_status(document_id: int) -> dict[str, str | int]:
         "ocr_status": get_ocr_status(document_id),
         "ocr_progress": int(document.get("ocr_progress") or 0),
         "ocr_detail": document.get("ocr_detail") or "",
+        "document": attach_pdf_url(document),
     }
 
 

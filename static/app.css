@@ -204,26 +204,30 @@ button {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  min-height: 64px;
-  padding-bottom: 10px;
+  min-height: 92px;
+  padding-bottom: 12px;
 }
 
 .workspace-header__main {
   min-width: 0;
+  display: grid;
+  gap: 3px;
 }
 
 .workspace-breadcrumb {
-  margin: 6px 0 0;
+  min-height: 14px;
+  margin: 0;
   color: var(--text-faint);
   font-size: 11px;
   font-weight: 600;
+  line-height: 1.25;
 }
 
 .top-tabs {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  margin-bottom: 8px;
+  margin-bottom: 4px;
 }
 
 .top-tabs__item {
@@ -252,7 +256,8 @@ button {
 }
 
 .header-meta {
-  margin: 4px 0 0;
+  min-height: 18px;
+  margin: 0;
   color: var(--text-soft);
   font-size: 13px;
   line-height: 1.4;
@@ -1011,12 +1016,13 @@ textarea:disabled {
 
 .document-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 96px 72px auto;
+  grid-template-columns: minmax(0, 1fr) 96px 72px 316px;
   align-items: center;
   gap: 12px;
   min-height: 54px;
   padding: 10px 14px;
   border-bottom: 1px solid var(--line);
+  cursor: pointer;
 }
 
 .document-row:last-child,
@@ -1086,20 +1092,37 @@ textarea:disabled {
 }
 
 .document-row__pages {
+  justify-self: end;
   color: var(--text-soft);
   font-size: 12px;
+  text-align: right;
+  white-space: nowrap;
 }
 
 .document-row__actions {
-  display: flex;
+  display: grid;
+  grid-template-columns: 48px repeat(3, 68px) 26px;
   align-items: center;
+  justify-content: start;
   gap: 8px;
   flex: 0 0 auto;
+  min-width: 0;
+  cursor: default;
 }
 
 .doc-action {
   min-height: 26px;
   padding: 0 8px;
+  white-space: nowrap;
+}
+
+.document-row__actions .doc-action {
+  width: 100%;
+}
+
+.doc-action-spacer {
+  min-height: 26px;
+  visibility: hidden;
 }
 
 .doc-action--icon {
@@ -1120,6 +1143,55 @@ textarea:disabled {
 .doc-action--icon svg {
   width: 14px;
   height: 14px;
+}
+
+.document-index-info {
+  grid-column: 1 / -1;
+  padding: 10px 0 2px;
+  cursor: default;
+}
+
+.document-index-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px 12px;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(22, 119, 255, 0.035);
+}
+
+.document-index-field {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.document-index-field--wide {
+  grid-column: span 2;
+}
+
+.document-index-field--full {
+  grid-column: 1 / -1;
+}
+
+.document-index-field dt {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.document-index-field dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.document-index-field__block {
+  white-space: pre-wrap;
 }
 
 .history-list {
@@ -1626,6 +1698,18 @@ textarea:disabled {
   .document-row__actions,
   .history-item__actions {
     flex-wrap: wrap;
+  }
+
+  .document-index-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .document-index-field--wide {
+    grid-column: auto;
+  }
+
+  .document-index-field--full {
+    grid-column: auto;
   }
 
   .excel-field-grid,

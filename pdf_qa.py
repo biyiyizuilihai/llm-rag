@@ -20,22 +20,21 @@ from openai import OpenAI
 from pypdf import PdfReader, PdfWriter
 
 from storage import (
-    fts_search_document_profiles,
     delete_page_ocr,
     fts_search_pages,
+    get_chapter_summary,
     get_document,
     list_route_ready_documents,
     list_documents,
     get_page_ocr_text_map,
     phrase_search_pages,
-    phrase_search_document_profiles,
     save_page_ocr,
     save_document_profile_vector,
     save_page_vector,
+    update_chapter_summary,
     update_document_profile,
     update_ocr_status,
     vector_search_pages,
-    vector_search_document_profiles,
 )
 
 load_dotenv()
@@ -127,6 +126,7 @@ Rules:
 3. Infer search-friendly variants, likely English terms, abbreviations, and attachment or section hints when helpful.
 4. Prefer high-recall retrieval queries over conversational phrasing.
 5. scope must be one of: targeted, broad, overview.
+6. For all-caps acronyms, keep the original acronym and obvious punctuation variants, but do not invent expanded meanings unless the user provided them.
 
 JSON schema:
 {
@@ -209,6 +209,14 @@ RETRIEVAL_ALIAS_MAP = {
 }
 QUERY_UNDERSTANDING_MAX_TOKENS = 256
 DOCUMENT_PROFILE_MAX_TOKENS = 384
+DOCUMENT_CHAPTER_SUMMARY_MAX_TOKENS = max(
+    4096,
+    int(os.environ.get("DOCUMENT_CHAPTER_SUMMARY_MAX_TOKENS", "4096")),
+)
+DOCUMENT_CHAPTER_SUMMARY_CHUNK_SIZE = max(
+    1,
+    int(os.environ.get("DOCUMENT_CHAPTER_SUMMARY_CHUNK_SIZE", "40")),
+)
 DOCUMENT_ROUTING_TOP_K = 5
 MULTI_DOC_TOTAL_PAGE_BUDGET = 15
 MULTI_DOC_PER_DOC_PAGE_LIMIT = 6
@@ -231,6 +239,33 @@ JSON schema:
   "title_aliases": [string]
 }
 """
+DOCUMENT_RELEVANCE_FILTER_PROMPT = """你是文档相关性判断助手。
+
+系统已经先在多个文档中召回到了页面。请根据用户问题、文档名和文档画像摘要，判断哪些文档真正可能帮助回答问题。
+
+判断标准：
+- 文档必须包含问题涉及的实体、缩写、主题或流程，或者明显是同一业务领域资料。
+- 宁可多选也不要漏选；但明显无关的文档不要选。
+- 如果无法判断，保留可能相关的文档。
+
+只返回 JSON，格式：{"relevant_document_ids": [1, 2]}
+不要返回解释文字。"""
+DOCUMENT_CHAPTER_SUMMARY_PROMPT = """你是一个文档内容分布分析助手。请根据以下 PDF 文档的完整 OCR 文本，输出“哪页到哪页主要讲什么”的内容分布摘要。
+
+要求：
+1. 识别主要内容块，可以是正式章节、节（Section）、附录（Appendix/Attachment）、表格/表单，也可以是自然主题段落。
+2. 每个内容块单独一行，格式严格为：内容标题（第X-Y页）：一句话说明主要内容。
+3. 按页码从小到大顺序输出。
+4. 如果文档没有明显章节，不要硬编“第1章/第2章”，请按页面内容给出简短主题标题。
+5. 如果文档只有一页或是表单/清单，也可以输出“整体内容（第1页）：...”或“表单主体（第1-2页）：...”。
+6. 只输出内容分布列表，不要有任何其他说明或前缀。
+
+示例输出：
+引言与适用范围（第1-4页）：介绍项目背景、适用范围和主要术语定义。
+质量要求与处理流程（第5-22页）：规定材料规格、工艺参数、检验标准及不合格品处理流程。
+文件与记录要求（第23-28页）：说明文件控制要求、记录保存期限和变更管理程序。
+检查记录表（第29-32页）：提供质量检查的标准记录表格和填写说明。
+缩略词表（第33-34页）：列出文档中所用缩略词及其含义。"""
 FORM_TEMPLATE_FIELD_HINTS = (
     "issue to",
     "lot no",
@@ -549,6 +584,102 @@ def build_document_profile(document_id: int) -> dict[str, Any]:
     return payload
 
 
+def build_chapter_summary_user_message(
+    document: dict[str, Any],
+    text_map: dict[int, str],
+    *,
+    start_page: int,
+    end_page: int,
+) -> str:
+    total_pages = int(document.get("page_count") or 0)
+    page_blocks: list[str] = []
+    for page_number in range(start_page, end_page + 1):
+        text = str(text_map.get(page_number) or "").strip()
+        page_blocks.append(f"[第{page_number}页]\n{text}" if text else f"[第{page_number}页]\n（空页）")
+
+    return (
+        f"文档：{document.get('file_name', '')}（共 {total_pages} 页）\n"
+        f"当前需要分析的页码范围：第 {start_page}-{end_page} 页。\n"
+        "请只输出这个页码范围内的内容分布，不要概括范围外页面。\n\n"
+        + "\n\n".join(page_blocks)
+    )
+
+
+def create_chapter_summary_for_range(
+    client: Any,
+    document: dict[str, Any],
+    text_map: dict[int, str],
+    *,
+    start_page: int,
+    end_page: int,
+) -> str:
+    user_message = build_chapter_summary_user_message(
+        document,
+        text_map,
+        start_page=start_page,
+        end_page=end_page,
+    )
+    response = client.chat.completions.create(
+        model=DEFAULT_MODEL,
+        messages=[
+            {"role": "system", "content": DOCUMENT_CHAPTER_SUMMARY_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        max_tokens=DOCUMENT_CHAPTER_SUMMARY_MAX_TOKENS,
+        temperature=0,
+        extra_body={"enable_thinking": False},
+    )
+
+    chapter_summary = extract_response_text(response.choices[0].message.content).strip()
+    if not chapter_summary:
+        raise RuntimeError("章节摘要生成失败：模型未返回内容。")
+    finish_reason = str(getattr(response.choices[0], "finish_reason", "") or "").lower()
+    if finish_reason == "length":
+        raise RuntimeError(f"内容分布生成被截断：第 {start_page}-{end_page} 页输出达到 max_tokens。")
+    return chapter_summary
+
+
+def build_chapter_summary(document_id: int) -> str:
+    document = get_document(document_id)
+    if not document:
+        raise RuntimeError(f"文档不存在：{document_id}")
+
+    text_map = get_page_ocr_text_map(document_id)
+    if not text_map:
+        raise RuntimeError("OCR 文本为空，无法生成章节摘要。")
+
+    total_pages = int(document.get("page_count") or 0)
+    if total_pages <= 0:
+        raise RuntimeError("PDF 页数为空，无法生成章节摘要。")
+
+    client = build_openai_client(DEFAULT_BASE_URL)
+    page_ranges = iter_pdf_chunk_ranges(total_pages, DOCUMENT_CHAPTER_SUMMARY_CHUNK_SIZE)
+    summaries: list[str] = []
+    for start_page, end_page in page_ranges:
+        summaries.append(
+            create_chapter_summary_for_range(
+                client,
+                document,
+                text_map,
+                start_page=start_page,
+                end_page=end_page,
+            )
+        )
+
+    chapter_summary = "\n".join(summary.strip() for summary in summaries if summary.strip()).strip()
+    if not chapter_summary:
+        raise RuntimeError("章节摘要生成失败：模型未返回内容。")
+
+    update_chapter_summary(document_id, chapter_summary)
+    logger.info(
+        "[chapter_summary.done] document_id=%s chunks=%s lines=%s",
+        document_id,
+        len(page_ranges),
+        len(chapter_summary.splitlines()),
+    )
+    return chapter_summary
+
+
 def find_explicit_document_matches(question: str) -> list[dict[str, Any]]:
     normalized_question = normalize_route_token(question)
     if not normalized_question:
@@ -587,9 +718,9 @@ def route_documents(question: str, top_k: int = DOCUMENT_ROUTING_TOP_K) -> list[
         )
         return explicit_matches[:top_k]
 
-    route_ready_docs = {int(doc["id"]): doc for doc in list_route_ready_documents()}
+    route_ready_docs = list_route_ready_documents()
     if not route_ready_docs:
-        fallback_docs = [
+        route_ready_docs = [
             document
             for document in list_documents()
             if str(document.get("ocr_status") or "").strip() == "done"
@@ -597,62 +728,15 @@ def route_documents(question: str, top_k: int = DOCUMENT_ROUTING_TOP_K) -> list[
         logger.warning(
             "[doc.route.fallback_no_profile] question=%r document_ids=%s",
             preview_text(question),
-            [int(document["id"]) for document in fallback_docs[:top_k]],
+            [int(document["id"]) for document in route_ready_docs],
         )
-        return fallback_docs[:top_k]
 
-    query_plan: dict[str, Any] = {}
-    try:
-        query_plan = understand_retrieval_query(question)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("[doc.route.plan.error] question=%r error=%s", preview_text(question), exc)
-
-    query_variants = build_query_variants(question, query_plan=query_plan) or [question]
-    scores: dict[int, int] = {}
-    first_seen: dict[int, tuple[int, int, str]] = {}
-
-    for variant_index, variant in enumerate(query_variants):
-        for search_kind, results in (
-            ("phrase", phrase_search_document_profiles(variant, top_k=top_k)),
-            ("fts", fts_search_document_profiles(variant, top_k=top_k)),
-        ):
-            for rank, document_id in enumerate(results):
-                if document_id not in route_ready_docs:
-                    continue
-                weight = max(1, top_k - rank) + max(1, len(query_variants) - variant_index)
-                scores[document_id] = scores.get(document_id, 0) + weight
-                first_seen.setdefault(document_id, (variant_index, rank, search_kind))
-
-    try:
-        query_embeddings = encode_texts(query_variants)
-    except Exception:
-        query_embeddings = []
-
-    for variant_index, embedding in enumerate(query_embeddings):
-        for rank, document_id in enumerate(vector_search_document_profiles(embedding, top_k=top_k)):
-            if document_id not in route_ready_docs:
-                continue
-            weight = max(1, top_k - rank) + max(1, len(query_variants) - variant_index)
-            scores[document_id] = scores.get(document_id, 0) + weight
-            first_seen.setdefault(document_id, (variant_index, rank, "vector"))
-
-    ordered_ids = sorted(
-        scores or route_ready_docs,
-        key=lambda document_id: (
-            -scores.get(document_id, 0),
-            first_seen.get(document_id, (999, 999, ""))[0],
-            first_seen.get(document_id, (999, 999, ""))[1],
-            document_id,
-        ),
-    )[:top_k]
-
-    routed = [route_ready_docs[document_id] for document_id in ordered_ids]
     logger.info(
         "[doc.route] question=%r document_ids=%s",
         preview_text(question),
-        ordered_ids,
+        [int(document["id"]) for document in route_ready_docs],
     )
-    return routed
+    return route_ready_docs
 
 
 def is_toc_like_page(text: str) -> bool:
@@ -1153,10 +1237,14 @@ def build_document_user_message(
     page_images: list[dict[str, Any]],
     question: str,
     api_max_pixels_per_page: Optional[int] = LLM_RENDER_MAX_PIXELS,
+    document_summaries: dict[int, str] | None = None,
 ) -> dict[str, Any]:
-    intro = (
-        "你将看到同一个 PDF 的页面图片。"
-        "这是当前会话唯一需要参考的文档。"
+    document_ids = {int(item.get("document_id") or 0) for item in page_images if item.get("document_id")}
+    if len(document_ids) > 1:
+        scope_intro = "你将看到多个 PDF 的页面图片。这些页面来自系统为当前问题召回出的候选文档。"
+    else:
+        scope_intro = "你将看到同一个 PDF 的页面图片。这是当前会话唯一需要参考的文档。"
+    intro = scope_intro + (
         "请基于这些页面回答问题。"
         "如果答案依赖具体页面，请尽量注明页码。"
         "若信息不足，请明确说明缺少哪部分。"
@@ -1166,6 +1254,24 @@ def build_document_user_message(
     )
 
     content: list[dict[str, Any]] = [{"type": "text", "text": intro}]
+    if document_summaries:
+        summary_lines = ["【文档内容分布参考】", "（以下为各文档的页码范围摘要，供你定位答案所在页面，实际内容以下方页面图片为准）", ""]
+        seen_doc_ids: set[int] = set()
+        for item in page_images:
+            doc_id = int(item.get("document_id") or 0)
+            if doc_id in seen_doc_ids or doc_id not in document_summaries:
+                continue
+            seen_doc_ids.add(doc_id)
+            document_name = str(item.get("document_display_name") or item.get("document_name") or "文档")
+            summary = str(document_summaries.get(doc_id) or "").strip()
+            if not summary:
+                continue
+            summary_lines.append(f"▶ {document_name}")
+            summary_lines.append(summary)
+            summary_lines.append("")
+        if seen_doc_ids:
+            content.append({"type": "text", "text": "\n".join(summary_lines)})
+
     for item in page_images:
         page_num = int(item["page_number"])
         data_url = str(item["data_url"])
@@ -1216,6 +1322,7 @@ def build_chat_messages(
     api_max_pixels_per_page: Optional[int] = LLM_RENDER_MAX_PIXELS,
     max_history_messages: int = 12,
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    document_summaries: dict[int, str] | None = None,
 ) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = [
         {
@@ -1233,6 +1340,7 @@ def build_chat_messages(
             page_images=page_images,
             question=question,
             api_max_pixels_per_page=api_max_pixels_per_page,
+            document_summaries=document_summaries,
         )
     )
     return messages
@@ -1851,9 +1959,9 @@ def ocr_pipeline(document_id: int, pdf_path: str) -> None:
 
         update_ocr_status(
             document_id,
-            "done",
-            progress=100,
-            detail="索引构建完成，已切换到精准检索模式。",
+            "processing",
+            progress=99,
+            detail="页级索引已完成，正在生成文档画像。",
         )
         try:
             update_document_profile(
@@ -1873,6 +1981,40 @@ def ocr_pipeline(document_id: int, pdf_path: str) -> None:
                 profile_status="failed",
                 profile_detail=f"文档画像不可用：{profile_exc}",
             )
+            update_ocr_status(
+                document_id,
+                "done",
+                progress=100,
+                detail=f"页级索引已完成，文档画像不可用：{profile_exc}",
+            )
+        else:
+            try:
+                update_ocr_status(
+                    document_id,
+                    "processing",
+                    progress=99,
+                    detail="文档画像已生成，正在生成内容分布。",
+                )
+                build_chapter_summary(document_id)
+            except Exception as summary_exc:  # noqa: BLE001
+                logger.warning(
+                    "[chapter_summary.failed] document_id=%s error=%s",
+                    document_id,
+                    summary_exc,
+                )
+                update_ocr_status(
+                    document_id,
+                    "done",
+                    progress=100,
+                    detail=f"页级索引和文档画像已完成，内容分布生成失败：{summary_exc}",
+                )
+            else:
+                update_ocr_status(
+                    document_id,
+                    "done",
+                    progress=100,
+                    detail="索引构建完成，可进行关键词、全文、向量检索和文档路由。",
+                )
     except Exception as exc:  # noqa: BLE001
         update_ocr_status(
             document_id,
@@ -1891,17 +2033,20 @@ def retrieve_pages(
     vec_top_k: int = 4,
     window: int = 2,
     max_pages: int = 16,
+    allow_fallback: bool = True,
+    query_plan: dict[str, Any] | None = None,
 ) -> list[int]:
-    query_plan: dict[str, Any] = {}
     page_text_map = get_page_ocr_text_map(document_id)
-    try:
-        query_plan = understand_retrieval_query(question)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "[query.understanding.error] question=%r error=%s",
-            preview_text(question),
-            exc,
-        )
+    if query_plan is None:
+        query_plan = {}
+        try:
+            query_plan = understand_retrieval_query(question)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[query.understanding.error] question=%r error=%s",
+                preview_text(question),
+                exc,
+            )
 
     plan_scope = str(query_plan.get("scope") or "").strip().lower()
     scope = plan_scope if plan_scope in {"targeted", "broad", "overview"} else detect_question_scope(question)
@@ -1983,6 +2128,14 @@ def retrieve_pages(
         hit_pages.append(page_number)
 
     if not hit_pages and scope != "overview":
+        if not allow_fallback:
+            logger.info(
+                "[retrieval.no_hits] document_id=%s scope=%s question=%r fallback=disabled",
+                document_id,
+                scope,
+                preview_text(question),
+            )
+            return []
         fallback_pages = collect_sparse_fallback_pages(
             document_id=document_id,
             total_pages=total_pages,
@@ -2117,6 +2270,9 @@ def build_chat_request(
         api_max_pixels_per_page=api_max_pixels_per_page,
         max_history_messages=max_history_messages,
         system_prompt=system_prompt,
+        document_summaries={
+            int(document["id"]): document.get("chapter_summary") or get_chapter_summary(int(document["id"]))
+        },
     )
     logger.info("[chat.request.full] question=%r page_count=%s history_messages=%s", preview_text(question), len(page_images), len(conversation_history))
     return client, messages, page_images
@@ -2176,6 +2332,9 @@ def build_chat_request_v2(
         api_max_pixels_per_page=api_max_pixels_per_page,
         max_history_messages=max_history_messages,
         system_prompt=system_prompt,
+        document_summaries={
+            int(document["id"]): document.get("chapter_summary") or get_chapter_summary(int(document["id"]))
+        },
     )
     logger.info(
         "[chat.request.retrieval] document_id=%s question=%r context_pages=%s page_images=%s history_messages=%s",
@@ -2238,25 +2397,119 @@ def append_sources_block(answer: str, answer_sources: list[dict[str, Any]]) -> s
     return answer.rstrip() + "\n" + "\n".join(lines)
 
 
+def filter_documents_by_relevance(
+    question: str,
+    doc_pages: list[tuple[dict[str, Any], list[int]]],
+    base_url: str = DEFAULT_BASE_URL,
+) -> list[tuple[dict[str, Any], list[int]]]:
+    if len(doc_pages) <= 1:
+        return doc_pages
+
+    doc_descriptions: list[str] = []
+    for document, pages in doc_pages:
+        doc_id = int(document["id"])
+        name = document.get("display_name") or document.get("file_name") or ""
+        summary = document.get("summary_text") or document.get("profile_detail") or ""
+        chapter_summary = document.get("chapter_summary") or ""
+        doc_type = document.get("doc_type") or ""
+        keywords = "、".join(str(item) for item in (document.get("keywords") or []) if str(item).strip())
+        aliases = "、".join(str(item) for item in (document.get("title_aliases") or []) if str(item).strip())
+        page_list = ", ".join(str(page) for page in pages[:12])
+        doc_descriptions.append(
+            f"[document_id={doc_id}]\n"
+            f"文件名：{name}\n"
+            f"文档类型：{doc_type}\n"
+            f"摘要：{summary}\n"
+            f"关键词：{keywords}\n"
+            f"标题别名：{aliases}\n"
+            f"内容分布：\n{chapter_summary}\n"
+            f"已召回页码：{page_list}"
+        )
+
+    started_at = time.perf_counter()
+    try:
+        user_message = f"用户问题：{question}\n\n" + "\n\n".join(doc_descriptions)
+        client = build_openai_client(base_url)
+        response = client.chat.completions.create(
+            model=DEFAULT_MODEL,
+            messages=[
+                {"role": "system", "content": DOCUMENT_RELEVANCE_FILTER_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            max_tokens=128,
+            temperature=0,
+            response_format={"type": "json_object"},
+            extra_body={"enable_thinking": False},
+        )
+        raw_content = extract_response_text(response.choices[0].message.content)
+        parsed = _extract_json_object(raw_content)
+        relevant_ids = {
+            int(document_id)
+            for document_id in (parsed.get("relevant_document_ids") or [])
+            if str(document_id).strip().isdigit()
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[doc.relevance_filter.error] question=%r error=%s", preview_text(question), exc)
+        return doc_pages
+
+    elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    if not relevant_ids:
+        logger.warning(
+            "[doc.relevance_filter] elapsed_ms=%s question=%r all_filtered_out fallback=all",
+            elapsed_ms,
+            preview_text(question),
+        )
+        return doc_pages
+
+    filtered = [(document, pages) for document, pages in doc_pages if int(document["id"]) in relevant_ids]
+    logger.info(
+        "[doc.relevance_filter] elapsed_ms=%s question=%r before=%s after=%s relevant_ids=%s",
+        elapsed_ms,
+        preview_text(question),
+        [int(document["id"]) for document, _ in doc_pages],
+        [int(document["id"]) for document, _ in filtered],
+        sorted(relevant_ids),
+    )
+    return filtered if filtered else doc_pages
+
+
 def retrieve_multi_document_context(
     question: str,
     routed_documents: list[dict[str, Any]],
     total_page_budget: int = MULTI_DOC_TOTAL_PAGE_BUDGET,
     per_doc_page_limit: int = MULTI_DOC_PER_DOC_PAGE_LIMIT,
+    base_url: str = DEFAULT_BASE_URL,
 ) -> list[dict[str, Any]]:
-    context_sources: list[dict[str, Any]] = []
     single_document = len(routed_documents) == 1
-    effective_per_doc_limit = MULTI_DOC_SINGLE_DOC_PAGE_LIMIT if single_document else per_doc_page_limit
-    effective_total_budget = max(total_page_budget, effective_per_doc_limit) if single_document else total_page_budget
-    for rank_index, document in enumerate(routed_documents, start=1):
+    shared_query_plan: dict[str, Any] = {}
+    try:
+        shared_query_plan = understand_retrieval_query(question)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[multi.query.understanding.error] question=%r error=%s", preview_text(question), exc)
+
+    doc_pages: list[tuple[dict[str, Any], list[int]]] = []
+    for document in routed_documents:
         pages = retrieve_pages(
             question=question,
             document_id=int(document["id"]),
             total_pages=int(document["page_count"]),
-            max_pages=effective_per_doc_limit,
+            allow_fallback=single_document,
+            query_plan=shared_query_plan,
+            max_pages=MULTI_DOC_SINGLE_DOC_PAGE_LIMIT,
         )
         if not pages:
             continue
+        doc_pages.append((document, pages))
+
+    if not single_document:
+        doc_pages = filter_documents_by_relevance(question, doc_pages, base_url=base_url)
+    doc_pages.sort(key=lambda item: -len(item[1]))
+
+    effective_per_doc_limit = MULTI_DOC_SINGLE_DOC_PAGE_LIMIT if len(doc_pages) == 1 else per_doc_page_limit
+    effective_total_budget = max(total_page_budget, effective_per_doc_limit)
+
+    context_sources: list[dict[str, Any]] = []
+    for rank_index, (document, pages) in enumerate(doc_pages, start=1):
         for local_rank, page_number in enumerate(pages[:effective_per_doc_limit], start=1):
             context_sources.append(
                 {
@@ -2294,7 +2547,11 @@ def build_chat_request_multi(
     if not routed_documents:
         raise ValueError("当前没有可用于多文档路由的已完成索引文档。")
 
-    context_sources = retrieve_multi_document_context(question, routed_documents)
+    context_sources = retrieve_multi_document_context(
+        question,
+        routed_documents,
+        base_url=base_url,
+    )
     if not context_sources:
         fallback_document = routed_documents[0]
         client, messages, page_images = build_chat_request(
@@ -2329,6 +2586,16 @@ def build_chat_request_multi(
     if not page_images:
         raise ValueError("多文档命中的页面图片不存在，请重建索引后重试。")
 
+    survived_doc_ids = {int(source["document_id"]) for source in context_sources}
+    document_summaries: dict[int, str] = {}
+    for document in routed_documents:
+        doc_id = int(document["id"])
+        if doc_id not in survived_doc_ids:
+            continue
+        summary = document.get("chapter_summary") or get_chapter_summary(doc_id)
+        if summary:
+            document_summaries[doc_id] = summary
+
     client = build_openai_client(base_url)
     messages = build_chat_messages(
         page_images=page_images,
@@ -2337,6 +2604,7 @@ def build_chat_request_multi(
         api_max_pixels_per_page=api_max_pixels_per_page,
         max_history_messages=max_history_messages,
         system_prompt=system_prompt,
+        document_summaries=document_summaries,
     )
     return client, messages, page_images, routed_documents, build_answer_sources(context_sources)
 

@@ -179,6 +179,17 @@ def _ensure_messages_metadata_column(conn: sqlite3.Connection) -> None:
         )
 
 
+def _ensure_document_chapter_summary_column(conn: sqlite3.Connection) -> None:
+    existing_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(document_profiles)").fetchall()
+    }
+    if "chapter_summary" not in existing_columns:
+        conn.execute(
+            "ALTER TABLE document_profiles ADD COLUMN chapter_summary TEXT NOT NULL DEFAULT ''"
+        )
+
+
 def _ensure_document_file_columns(conn: sqlite3.Connection) -> None:
     existing_columns = {
         row["name"]
@@ -291,6 +302,7 @@ def init_db() -> None:
                 keywords_json TEXT NOT NULL DEFAULT '[]',
                 title_aliases_json TEXT NOT NULL DEFAULT '[]',
                 route_text TEXT NOT NULL DEFAULT '',
+                chapter_summary TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
             );
@@ -357,6 +369,7 @@ def init_db() -> None:
         _ensure_document_file_columns(conn)
         _ensure_document_ocr_columns(conn)
         _ensure_messages_metadata_column(conn)
+        _ensure_document_chapter_summary_column(conn)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_page_ocr_document_page ON page_ocr(document_id, page_number)"
         )
@@ -451,6 +464,8 @@ def _document_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
             payload["title_aliases"] = json.loads(row["title_aliases_json"] or "[]")
         except Exception:
             payload["title_aliases"] = []
+    if "chapter_summary" in row.keys():
+        payload["chapter_summary"] = row["chapter_summary"] or ""
     return payload
 
 
@@ -551,7 +566,8 @@ def list_documents() -> list[dict[str, Any]]:
                 dp.summary_text,
                 dp.doc_type,
                 dp.keywords_json,
-                dp.title_aliases_json
+                dp.title_aliases_json,
+                dp.chapter_summary
             FROM documents d
             LEFT JOIN document_profiles dp ON dp.document_id = d.id
             ORDER BY d.updated_at DESC, d.id DESC
@@ -571,7 +587,8 @@ def get_document(document_id: int) -> dict[str, Any] | None:
                 dp.summary_text,
                 dp.doc_type,
                 dp.keywords_json,
-                dp.title_aliases_json
+                dp.title_aliases_json,
+                dp.chapter_summary
             FROM documents d
             LEFT JOIN document_profiles dp ON dp.document_id = d.id
             WHERE d.id = ?
@@ -592,7 +609,8 @@ def get_document_by_sha(file_sha256: str) -> dict[str, Any] | None:
                 dp.summary_text,
                 dp.doc_type,
                 dp.keywords_json,
-                dp.title_aliases_json
+                dp.title_aliases_json,
+                dp.chapter_summary
             FROM documents d
             LEFT JOIN document_profiles dp ON dp.document_id = d.id
             WHERE d.file_sha256 = ?
@@ -1753,6 +1771,7 @@ def list_conversation_documents(conversation_id: int) -> list[dict[str, Any]]:
                 dp.doc_type,
                 dp.keywords_json,
                 dp.title_aliases_json,
+                dp.chapter_summary,
                 cd.rank_index
             FROM conversation_documents cd
             JOIN documents d ON d.id = cd.document_id
@@ -1835,6 +1854,30 @@ def update_document_profile(
             """,
             (document_id, route_text.strip()),
         )
+
+
+def update_chapter_summary(document_id: int, chapter_summary: str) -> None:
+    now = utc_now()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO document_profiles (document_id, chapter_summary, profile_status, updated_at)
+            VALUES (?, ?, 'done', ?)
+            ON CONFLICT(document_id) DO UPDATE SET
+                chapter_summary = excluded.chapter_summary,
+                updated_at = excluded.updated_at
+            """,
+            (document_id, chapter_summary, now),
+        )
+
+
+def get_chapter_summary(document_id: int) -> str:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT chapter_summary FROM document_profiles WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+    return str(row["chapter_summary"] or "") if row else ""
 
 
 def save_document_profile_vector(document_id: int, embedding: list[float]) -> None:
@@ -1959,7 +2002,8 @@ def list_route_ready_documents() -> list[dict[str, Any]]:
                 dp.summary_text,
                 dp.doc_type,
                 dp.keywords_json,
-                dp.title_aliases_json
+                dp.title_aliases_json,
+                dp.chapter_summary
             FROM documents d
             JOIN document_profiles dp ON dp.document_id = d.id
             WHERE d.ocr_status = 'done'

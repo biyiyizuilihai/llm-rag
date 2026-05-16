@@ -6,6 +6,7 @@ const state = {
   preferredMode: "global",
   documentSearchQuery: "",
   documentFilter: "all",
+  expandedDocumentIndexInfoIds: new Set(),
   activeDocumentId: null,
   activeConversationId: null,
   isSubmitting: false,
@@ -155,11 +156,11 @@ function bindEvents() {
   refs.uploadButton.addEventListener("click", () => refs.fileInput.click())
   refs.docsUploadButton.addEventListener("click", () => refs.fileInput.click())
   refs.fileInput.addEventListener("change", async (event) => {
-    const file = event.target.files?.[0]
-    if (!file) {
+    const files = Array.from(event.target.files || [])
+    if (!files.length) {
       return
     }
-    await uploadDocument(file)
+    await uploadDocuments(files)
     refs.fileInput.value = ""
   })
 
@@ -731,7 +732,11 @@ function setSection(section) {
 }
 
 function hasAnyQueryableDocument() {
-  return state.documents.some((document) => document.ocr_status === "done")
+  return readyDocumentCount() > 0
+}
+
+function readyDocumentCount() {
+  return state.documents.filter((document) => isDocumentIndexReady(document)).length
 }
 
 function isExcelDocument(document) {
@@ -856,6 +861,128 @@ function buildDocumentIndexStatusLine(document) {
   }
 }
 
+function formatIndexInfoValue(value, fallback = "—") {
+  const normalized = String(value || "").replace(/\s+/g, " ").trim()
+  return normalized || fallback
+}
+
+function formatIndexInfoBlock(value, fallback = "—") {
+  const lines = String(value || "")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/[ \t]+/g, " ").trim())
+    .filter(Boolean)
+  return lines.length ? lines.join("\n") : fallback
+}
+
+function formatIndexInfoList(values) {
+  const items = Array.from(values || [])
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+  if (!items.length) {
+    return "—"
+  }
+  return items.join(" · ")
+}
+
+function formatProfileStatus(status) {
+  const normalized = String(status || "").trim().toLowerCase()
+  if (normalized === "done") {
+    return "已生成"
+  }
+  if (normalized === "processing") {
+    return "生成中"
+  }
+  if (normalized === "failed") {
+    return "失败"
+  }
+  return formatIndexInfoValue(status)
+}
+
+function formatOcrDetail(detail) {
+  const text = formatIndexInfoValue(detail)
+  if (text === "索引构建完成，已切换到精准检索模式。") {
+    return "页级索引已完成，可进行关键词、全文和向量检索。"
+  }
+  return text
+}
+
+function toggleDocumentIndexInfo(documentId) {
+  if (!documentId) {
+    return
+  }
+  if (state.expandedDocumentIndexInfoIds.has(documentId)) {
+    state.expandedDocumentIndexInfoIds.delete(documentId)
+  } else {
+    state.expandedDocumentIndexInfoIds.add(documentId)
+  }
+  renderDocuments()
+}
+
+function isDocumentRowToggleIgnoredTarget(target) {
+  if (!target || typeof target.closest !== "function") {
+    return false
+  }
+  return Boolean(target.closest("button, a, input, textarea, select, label, .document-index-info"))
+}
+
+function renderDocumentIndexInfo(document) {
+  const statusLabel = buildDocumentIndexLabel(document)
+  const progress = `${documentOcrProgress(document)}%`
+  const ocrDetail = formatOcrDetail(documentOcrDetail(document))
+  const profileStatus = formatProfileStatus(document.profile_status || "")
+  const profileDetail = formatIndexInfoValue(document.profile_detail || "")
+  const docType = formatIndexInfoValue(document.doc_type || "")
+  const summary = formatIndexInfoValue(document.summary_text || "")
+  const chapterSummary = formatIndexInfoBlock(document.chapter_summary || "")
+  const keywords = formatIndexInfoList(document.keywords || [])
+  const aliases = formatIndexInfoList(document.title_aliases || [])
+
+  return `
+    <dl class="document-index-grid">
+      <div class="document-index-field">
+        <dt>索引状态</dt>
+        <dd>${escapeHtml(statusLabel)}</dd>
+      </div>
+      <div class="document-index-field">
+        <dt>进度</dt>
+        <dd>${escapeHtml(progress)}</dd>
+      </div>
+      <div class="document-index-field">
+        <dt>画像状态</dt>
+        <dd>${escapeHtml(profileStatus)}</dd>
+      </div>
+      <div class="document-index-field">
+        <dt>文档类型</dt>
+        <dd>${escapeHtml(docType)}</dd>
+      </div>
+      <div class="document-index-field document-index-field--wide">
+        <dt>摘要</dt>
+        <dd>${escapeHtml(summary)}</dd>
+      </div>
+      <div class="document-index-field document-index-field--full">
+        <dt>内容分布</dt>
+        <dd class="document-index-field__block">${escapeHtml(chapterSummary)}</dd>
+      </div>
+      <div class="document-index-field document-index-field--wide">
+        <dt>关键词</dt>
+        <dd>${escapeHtml(keywords)}</dd>
+      </div>
+      <div class="document-index-field document-index-field--wide">
+        <dt>别名</dt>
+        <dd>${escapeHtml(aliases)}</dd>
+      </div>
+      <div class="document-index-field document-index-field--wide">
+        <dt>索引详情</dt>
+        <dd>${escapeHtml(ocrDetail)}</dd>
+      </div>
+      <div class="document-index-field document-index-field--wide">
+        <dt>画像详情</dt>
+        <dd>${escapeHtml(profileDetail)}</dd>
+      </div>
+    </dl>
+  `
+}
+
 function documentLabel(document) {
   return `${document.display_name} v${document.version_index}`
 }
@@ -889,14 +1016,33 @@ function syncStatusActionButton() {
   refs.statusActionButton.disabled = !canRebuild
 }
 
-async function uploadDocument(file) {
+function isSupportedUploadFile(file) {
   const lowerName = file.name.toLowerCase()
-  const isSupported =
+  return (
     lowerName.endsWith(".pdf") ||
     lowerName.endsWith(".xls") ||
     lowerName.endsWith(".xlsx") ||
     lowerName.endsWith(".xlsm")
-  if (!isSupported) {
+  )
+}
+
+async function uploadDocumentRequest(file) {
+  const formData = new FormData()
+  formData.append("file", file)
+
+  return api("/api/documents", {
+    method: "POST",
+    body: formData,
+  })
+}
+
+function applyUploadedDocumentResult(result) {
+  state.documents = sortByUpdatedAt(upsertById(state.documents, result.document))
+  state.conversations = sortByUpdatedAt(upsertById(state.conversations, result.conversation))
+}
+
+async function uploadDocument(file) {
+  if (!isSupportedUploadFile(file)) {
     setStatusLine("仅支持上传 PDF 或 Excel（.xls/.xlsx/.xlsm）文件。", "warning")
     return
   }
@@ -906,16 +1052,9 @@ async function uploadDocument(file) {
   setStatusLine(`正在处理 ${file.name}。`, "info")
 
   try {
-    const formData = new FormData()
-    formData.append("file", file)
+    const result = await uploadDocumentRequest(file)
 
-    const result = await api("/api/documents", {
-      method: "POST",
-      body: formData,
-    })
-
-    state.documents = sortByUpdatedAt(upsertById(state.documents, result.document))
-    state.conversations = sortByUpdatedAt(upsertById(state.conversations, result.conversation))
+    applyUploadedDocumentResult(result)
     state.currentSection = "ask"
     await loadConversation(result.conversation.id, false)
 
@@ -933,6 +1072,90 @@ async function uploadDocument(file) {
   } catch (error) {
     console.error(error)
     setStatusLine(error.message || "上传失败。", "error")
+  } finally {
+    state.isSubmitting = false
+    syncComposerState()
+  }
+}
+
+async function uploadDocuments(files) {
+  const selectedFiles = Array.from(files || [])
+  if (!selectedFiles.length) {
+    return
+  }
+  if (selectedFiles.length === 1) {
+    await uploadDocument(selectedFiles[0])
+    return
+  }
+
+  const supportedFiles = selectedFiles.filter(isSupportedUploadFile)
+  const skippedCount = selectedFiles.length - supportedFiles.length
+  if (!supportedFiles.length) {
+    setStatusLine("仅支持上传 PDF 或 Excel（.xls/.xlsx/.xlsm）文件。", "warning")
+    return
+  }
+
+  state.isSubmitting = true
+  syncComposerState()
+  setStatusLine(
+    skippedCount
+      ? `正在上传 ${supportedFiles.length} 个文件，已跳过 ${skippedCount} 个不支持的文件。`
+      : `正在上传 ${supportedFiles.length} 个文件。`,
+    "info",
+  )
+
+  try {
+    const outcomes = await Promise.all(
+      supportedFiles.map(async (file) => {
+        try {
+          const result = await uploadDocumentRequest(file)
+          return { file, result, error: null }
+        } catch (error) {
+          return { file, result: null, error }
+        }
+      }),
+    )
+
+    const successes = outcomes.filter((item) => item.result)
+    const failures = outcomes.filter((item) => item.error)
+    const excelToConfigure = []
+
+    for (const item of successes) {
+      applyUploadedDocumentResult(item.result)
+      const document = item.result.document
+      if (document?.file_type === "excel" && item.result.excel_preview) {
+        excelToConfigure.push({
+          documentId: document.id,
+          preview: item.result.excel_preview,
+        })
+      } else if (document?.file_type !== "excel") {
+        void pollOcrStatus(document.id)
+      }
+    }
+
+    state.currentSection = "documents"
+    renderAll()
+
+    const summaryParts = []
+    if (successes.length) {
+      summaryParts.push(`已上传 ${successes.length} 个文件`)
+    }
+    if (excelToConfigure.length > 1) {
+      summaryParts.push(`${excelToConfigure.length} 个 Excel 需要在文档库配置字段`)
+    }
+    if (skippedCount) {
+      summaryParts.push(`跳过 ${skippedCount} 个不支持的文件`)
+    }
+    if (failures.length) {
+      const failedNames = failures.map((item) => item.file.name).slice(0, 3).join("、")
+      summaryParts.push(`${failures.length} 个失败：${failedNames}`)
+    }
+
+    setStatusLine(summaryParts.join("；") || "上传完成。", failures.length ? "warning" : "info")
+
+    if (excelToConfigure.length === 1) {
+      await configureExcelDocument(excelToConfigure[0].documentId, excelToConfigure[0].preview)
+    }
   } finally {
     state.isSubmitting = false
     syncComposerState()
@@ -1147,6 +1370,11 @@ function patchDocumentRow(document) {
     badgeEl.textContent = badge
     badgeEl.className = `document-status-badge ${badgeClass}`
   }
+
+  const indexInfo = card.querySelector(".document-index-info")
+  if (indexInfo) {
+    indexInfo.innerHTML = renderDocumentIndexInfo(document)
+  }
 }
 
 function syncWorkspaceChrome() {
@@ -1177,7 +1405,7 @@ function syncWorkspaceChrome() {
     refs.currentDocumentPill.textContent = currentDoc ? `预览 ${documentLabel(currentDoc)}` : "文档"
   } else {
     refs.headerBreadcrumb.textContent = buildBreadcrumb(isGlobalConversation ? null : currentDoc, conversation)
-    refs.conversationTitle.textContent = cleanTitle || (isGlobalConversation ? "问答" : currentDoc ? documentLabel(currentDoc) : "问答")
+    refs.conversationTitle.textContent = cleanTitle || (isGlobalConversation ? "全局问答" : currentDoc ? documentLabel(currentDoc) : "单文件问答")
     refs.headerMeta.textContent = buildHeaderMeta(isGlobalConversation ? null : currentDoc, conversation, hasMessages)
     refs.currentDocumentPill.textContent = isGlobalConversation ? "全局模式" : "单文件"
   }
@@ -1205,7 +1433,7 @@ function syncWorkspaceChrome() {
   }
 
   if (isGlobalConversation || !currentDoc) {
-    refs.emptyTitle.textContent = "开始问答"
+    refs.emptyTitle.textContent = isGlobalConversation ? "全局问答" : "单文件问答"
     refs.emptyCopy.textContent = isGlobalConversation ? "输入问题" : "先选择文档"
   } else if (!hasMessages) {
     if (readyToChat) {
@@ -1271,14 +1499,22 @@ async function pollOcrStatus(documentId) {
   try {
     while (Date.now() - start < maxWait) {
       const result = await api(`/api/documents/${documentId}/ocr-status`)
-      const status = result.ocr_status || "pending"
-      const document = state.documents.find((item) => item.id === documentId)
+      let status = result.ocr_status || "pending"
+      let document = state.documents.find((item) => item.id === documentId)
       const previousStatus = document?.ocr_status || "pending"
-      const nextProgress = Number(result.ocr_progress || 0)
-      const nextDetail = result.ocr_detail || ""
+      let nextProgress = Number(result.ocr_progress || 0)
+      let nextDetail = result.ocr_detail || ""
       let changed = true
 
-      if (document) {
+      if (result.document) {
+        const previousSnapshot = JSON.stringify(document || null)
+        state.documents = sortByUpdatedAt(upsertById(state.documents, result.document))
+        document = state.documents.find((item) => item.id === documentId)
+        status = document?.ocr_status || status
+        nextProgress = Number(document?.ocr_progress || nextProgress)
+        nextDetail = document?.ocr_detail || nextDetail
+        changed = previousSnapshot !== JSON.stringify(document || null)
+      } else if (document) {
         changed =
           document.ocr_status !== status ||
           Number(document.ocr_progress || 0) !== nextProgress ||
@@ -2012,13 +2248,20 @@ function renderDocuments() {
         ? `${Number(document.row_count || 0)} 行`
         : `${document.page_count} 页`
       const openButton = isExcelDocument(document)
-        ? ""
+        ? '<span class="doc-action-spacer" aria-hidden="true"></span>'
         : `<button class="doc-action" type="button" data-document-open="${document.id}">查看原文</button>`
       const configButton = isExcelDocument(document)
         ? `<button class="doc-action ${isDocumentIndexReady(document) ? "" : "doc-action--primary"}" type="button" data-excel-config="${document.id}">${isDocumentIndexReady(document) ? "重建索引" : "配置字段"}</button>`
         : ""
+      const rebuildButton = !isExcelDocument(document) && !isDocumentIndexBuilding(document)
+        ? `<button class="doc-action ${isDocumentIndexFailed(document) ? "doc-action--warn" : ""}" type="button" data-document-rebuild="${document.id}">重建索引</button>`
+        : isExcelDocument(document)
+          ? ""
+          : '<span class="doc-action-spacer" aria-hidden="true"></span>'
+      const indexInfoExpanded = state.expandedDocumentIndexInfoIds.has(document.id)
+      const indexInfoButtonLabel = indexInfoExpanded ? "收起索引" : "索引信息"
       return `
-        <article class="document-row ${activeClass}" data-document-card-id="${document.id}">
+        <article class="document-row ${activeClass}" data-document-card-id="${document.id}" aria-expanded="${indexInfoExpanded ? "true" : "false"}">
           <div class="document-row__main">
             <div class="document-row__title">
               <span class="document-row__name">${escapeHtml(document.file_name)}</span>
@@ -2030,9 +2273,10 @@ function renderDocuments() {
           <div class="document-row__pages">${sizeLabel}</div>
           <div class="document-row__actions">
             <button class="doc-action doc-action--primary" type="button" data-document-chat="${document.id}">问答</button>
+            <button class="doc-action" type="button" data-index-info-toggle="${document.id}" aria-expanded="${indexInfoExpanded ? "true" : "false"}">${indexInfoButtonLabel}</button>
             ${openButton}
             ${configButton}
-            ${badge === "失败" && !isExcelDocument(document) ? `<button class="doc-action doc-action--warn" type="button" data-document-rebuild="${document.id}">重建索引</button>` : ""}
+            ${rebuildButton}
             <button class="doc-action doc-action--icon" type="button" data-document-delete="${document.id}" aria-label="删除">
               <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
                 <path
@@ -2045,10 +2289,20 @@ function renderDocuments() {
               </svg>
             </button>
           </div>
+          <div class="document-index-info" ${indexInfoExpanded ? "" : "hidden"}>${renderDocumentIndexInfo(document)}</div>
         </article>
       `
     })
     .join("")
+
+  refs.documentLibraryGrid.querySelectorAll("[data-document-card-id]").forEach((element) => {
+    element.addEventListener("click", (event) => {
+      if (isDocumentRowToggleIgnoredTarget(event.target)) {
+        return
+      }
+      toggleDocumentIndexInfo(Number(element.dataset.documentCardId))
+    })
+  })
 
   refs.documentLibraryGrid.querySelectorAll("[data-document-chat]").forEach((element) => {
     element.addEventListener("click", async () => {
@@ -2059,6 +2313,12 @@ function renderDocuments() {
   refs.documentLibraryGrid.querySelectorAll("[data-document-open]").forEach((element) => {
     element.addEventListener("click", async () => {
       await previewDocument(Number(element.dataset.documentOpen), 1)
+    })
+  })
+
+  refs.documentLibraryGrid.querySelectorAll("[data-index-info-toggle]").forEach((element) => {
+    element.addEventListener("click", () => {
+      toggleDocumentIndexInfo(Number(element.dataset.indexInfoToggle))
     })
   })
 
@@ -2232,7 +2492,11 @@ function formatConversationTitle(title) {
 
 function buildHeaderMeta(document, conversation, hasMessages) {
   if (!document) {
-    return conversation ? "全局" : ""
+    const count = readyDocumentCount()
+    if (conversation) {
+      return hasMessages ? `全局 · ${state.messages.length} 条消息` : "全局 · 0 条消息"
+    }
+    return count ? `${count} 个就绪文档` : "等待文档"
   }
 
   const indexLabel = buildDocumentIndexLabel(document)
@@ -2254,7 +2518,7 @@ function buildHeaderMeta(document, conversation, hasMessages) {
 
 function buildBreadcrumb(document, conversation) {
   if (!document) {
-    return formatConversationTitle(conversation?.title || "") || "问答"
+    return "全部文档 › 问答"
   }
 
   const conversationLabel = formatConversationTitle(conversation?.title || "") || "问答"
