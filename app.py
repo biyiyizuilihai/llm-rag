@@ -232,6 +232,47 @@ def attach_answer_source_urls(answer_sources: list[dict]) -> list[dict]:
     return enriched
 
 
+def document_from_answer_sources(answer_sources: list[dict] | None) -> dict | None:
+    for source in answer_sources or []:
+        try:
+            document_id = int(source.get("document_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not document_id:
+            continue
+        document = get_document(document_id)
+        if document:
+            return document
+    return None
+
+
+def latest_answer_source_document(messages: list[dict]) -> dict | None:
+    for message in reversed(messages):
+        if message.get("role") != "assistant":
+            continue
+        metadata = message.get("metadata") or {}
+        document = document_from_answer_sources(metadata.get("answer_sources") or [])
+        if document:
+            return document
+    return None
+
+
+def select_preview_document(
+    bound_document: dict | None,
+    routed_documents: list[dict],
+    *,
+    answer_sources: list[dict] | None = None,
+    messages: list[dict] | None = None,
+) -> dict | None:
+    if bound_document:
+        return bound_document
+    return (
+        document_from_answer_sources(answer_sources)
+        or latest_answer_source_document(messages or [])
+        or (routed_documents[0] if routed_documents else None)
+    )
+
+
 def has_excel_retrieval_context(excel_request: dict[str, Any] | None) -> bool:
     """Return whether a global Excel preflight actually found usable evidence."""
     return bool(excel_request and excel_request.get("policies"))
@@ -466,12 +507,13 @@ def conversation_detail(conversation_id: int) -> dict:
 
     document_id = conversation.get("document_id")
     routed_documents = list_conversation_documents(conversation_id)
-    document = (
-        get_document(int(document_id))
-        if document_id
-        else (routed_documents[0] if routed_documents else None)
-    )
     messages = list_messages(conversation_id)
+    bound_document = get_document(int(document_id)) if document_id else None
+    document = select_preview_document(
+        bound_document,
+        routed_documents,
+        messages=messages,
+    )
     return {
         "conversation": conversation,
         "document": attach_pdf_url(document),
@@ -1110,6 +1152,11 @@ def stream_document(conversation_id: int, payload: AskPayload) -> StreamingRespo
             answer=answer,
             answer_sources=answer_sources,
         )
+        response_document = select_preview_document(
+            bound_document,
+            routed_documents,
+            answer_sources=answer_sources,
+        )
         logger.info(
             "[chat.stream.done] conversation_id=%s answer_len=%s reasoning_len=%s usage=%s summary=%s",
             conversation_id,
@@ -1123,7 +1170,7 @@ def stream_document(conversation_id: int, payload: AskPayload) -> StreamingRespo
             {
                 "type": "done",
                 "conversation": persisted_conversation,
-                "document": attach_pdf_url(routed_documents[0]) if routed_documents else None,
+                "document": attach_pdf_url(response_document),
                 "routed_documents": attach_pdf_urls(routed_documents),
                 "answer_sources": answer_sources,
                 "user_message": user_message,
@@ -1274,10 +1321,15 @@ def ask_document(conversation_id: int, payload: AskPayload) -> dict:
         answer=result["answer"],
         answer_sources=answer_sources,
     )
+    response_document = select_preview_document(
+        bound_document,
+        routed_documents,
+        answer_sources=answer_sources,
+    )
 
     return {
         "conversation": conversation,
-        "document": attach_pdf_url(routed_documents[0]) if routed_documents else None,
+        "document": attach_pdf_url(response_document),
         "routed_documents": attach_pdf_urls(routed_documents),
         "answer_sources": answer_sources,
         "user_message": user_message,
